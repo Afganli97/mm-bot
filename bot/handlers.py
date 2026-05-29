@@ -1,0 +1,98 @@
+"""
+Обработчики команд Telegram.
+"""
+import logging
+from datetime import datetime, date
+import re
+from telegram import Update
+from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters
+
+from bot.config import TELEGRAM_BOT_TOKEN, MAX_DEPTH
+from bot.database import get_all_api_usage, get_connection
+from bot.graph_traversal import GraphTraversal
+from bot.token_filter import update_top_tokens
+from web3 import Web3
+
+logger = logging.getLogger(__name__)
+
+# Валидация Ethereum адреса
+def is_valid_address(addr: str) -> bool:
+    try:
+        return Web3.is_address(addr)
+    except Exception:
+        return False
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Привет! Я бот для анализа цепочек покупок токенов маркет-мейкерами.\n"
+        "Отправь мне ERC-20 адрес, и я найду токены, купленные им и связанными адресами за последние 30 дней.\n"
+        "Доступные команды:\n"
+        "/help – справка\n"
+        "/dashboard – лимиты API"
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔍 <b>Как пользоваться:</b>\n"
+        "1. Отправьте Ethereum-адрес, с которого начать анализ.\n"
+        "2. Бот пройдёт по цепочке переводов ETH/WETH на глубину {MAX_DEPTH} и найдёт покупки токенов.\n"
+        "3. Исключаются стейблкоины и топ-100 монет.\n"
+        "4. Результат придёт в этом же чате.\n\n"
+        "⚠️ Время анализа зависит от количества адресов. Пожалуйста, ожидайте.",
+        parse_mode="HTML"
+    )
+
+async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usage = get_all_api_usage()
+    today = date.today().isoformat()
+    msg = f"📊 <b>API лимиты на сегодня ({today} UTC):</b>\n"
+    # Etherscan
+    for i in range(len(context.bot_data.get('etherscan_keys', []))):
+        used = usage.get(f"etherscan_{i}", 0)
+        msg += f"Etherscan ключ {i+1}: {used}/100,000 ({used/1000:.1f}%)\n"
+    # Alchemy
+    alchemy_used = usage.get("alchemy_0", 0)
+    msg += f"Alchemy: {alchemy_used} запросов (лимит высок)\n"
+    # Infura
+    infura_used = usage.get("infura_0", 0)
+    msg += f"Infura: {infura_used}/100,000 ({infura_used/1000:.1f}%)\n"
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if is_valid_address(text):
+        # Запускаем анализ в фоне
+        await update.message.reply_text("⏳ Запущен анализ цепочки... Это может занять время. Я сообщу результат позже.")
+        # Запускаем асинхронную задачу
+        asyncio_task = context.application.create_task(
+            run_analysis(update.effective_user.id, update.effective_chat.id, text, context)
+        )
+    else:
+        await update.message.reply_text("❌ Некорректный адрес Ethereum. Пожалуйста, проверьте и отправьте снова.")
+
+async def run_analysis(user_id: int, chat_id: int, address: str, context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача анализа."""
+    from aiohttp import ClientSession
+    try:
+        async with ClientSession() as session:
+            # Обновляем топ-100, если необходимо
+            await update_top_tokens(session)
+            traversal = GraphTraversal(session, address, user_id, chat_id)
+            found = await traversal.run()
+            # Формируем отчёт
+            if found:
+                token_lines = []
+                for item in found:
+                    token_lines.append(f"• <code>{item['token']}</code> ({item['symbol']}) — покупатель: <code>{item['buyer']}</code>")
+                report = (f"✅ <b>Анализ завершён!</b>\n"
+                          f"Проверено адресов: {traversal.total_addresses}\n"
+                          f"Найдено уникальных токенов: {len(found)}\n\n"
+                          + "\n".join(token_lines))
+            else:
+                report = (f"✅ <b>Анализ завершён.</b>\n"
+                          f"Проверено адресов: {traversal.total_addresses}\n"
+                          f"Токены, удовлетворяющие условиям, не найдены.")
+            await context.bot.send_message(chat_id, report, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        logger.exception("Ошибка в задаче анализа")
+        await context.bot.send_message(chat_id, f"❌ Произошла ошибка: {str(e)}")
