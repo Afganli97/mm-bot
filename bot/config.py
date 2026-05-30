@@ -31,6 +31,7 @@ MAX_BRANCHES_PER_ADDRESS = 50      # макс. число получателей
 LOOKBACK_DAYS = 30                 # анализируемый период
 MIN_TRANSFER_VALUE_ETH = 0.001     # минимальная сумма перевода ETH/WETH для включения
 MAX_ADDRESSES_PER_TASK = 2000      # предельное число адресов за одну задачу
+MAX_FOUND_TOKENS = 100             # максимальное количество найденных токенов (остановить поиск после достижения)
 
 # ---------- Адреса контрактов (Ethereum Mainnet) ----------
 WETH_ADDRESS = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
