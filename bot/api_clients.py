@@ -65,6 +65,7 @@ class APIKeyRotator:
             if self.service == "etherscan":
                 params = params or {}
                 params["apikey"] = key
+                params["chainid"] = 1
             try:
                 async with session.get(url, params=params, timeout=30) as resp:
                     if resp.status == 200:
