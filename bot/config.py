@@ -10,6 +10,12 @@ load_dotenv()
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+# Разрешённые пользователи (только им бот отвечает)
+ALLOWED_USER_IDS = set()
+raw_ids = os.getenv("ALLOWED_USER_IDS", "")
+if raw_ids:
+    ALLOWED_USER_IDS = {int(uid.strip()) for uid in raw_ids.split(",") if uid.strip().isdigit()}
+
 # Etherscan API ключи (список)
 ETHERSCAN_API_KEYS = [k.strip() for k in os.getenv("ETHERSCAN_API_KEYS", "").split(",") if k.strip()]
 # Alchemy
