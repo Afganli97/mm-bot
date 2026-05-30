@@ -168,16 +168,6 @@ def get_api_usage_today(service: str, key_index: int) -> int:
         ).fetchone()
         return row['count'] if row else 0
 
-def reset_daily_counters_if_needed(service: str, key_index: int):
-    """Удаляет устаревшие счётчики (не сегодняшние) — вызывается при старте."""
-    today = date.today().isoformat()
-    with get_connection() as conn:
-        conn.execute(
-            "DELETE FROM api_usage WHERE service=? AND key_index=? AND usage_date != ?",
-            (service, key_index, today)
-        )
-        conn.commit()
-
 def get_all_api_usage() -> dict:
     """Возвращает словарь с использованными лимитами для /dashboard."""
     today = date.today().isoformat()
