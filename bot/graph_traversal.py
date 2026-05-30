@@ -3,6 +3,7 @@
 """
 import asyncio
 import logging
+import time
 from collections import deque
 from typing import List, Dict, Set, Optional
 import aiohttp
@@ -41,7 +42,7 @@ class GraphTraversal:
             self.request_id = create_request(self.user_id, self.chat_id, self.start_address, MAX_DEPTH)
 
             # Получаем блок 30 дней назад
-            now_ts = int(asyncio.get_event_loop().time())
+            now_ts = int(time.time())                     # РЕАЛЬНОЕ UNIX-время в секундах
             thirty_days_ago_ts = now_ts - LOOKBACK_DAYS * 86400
             self.start_block = await EtherscanClient.get_block_by_timestamp(self.session, thirty_days_ago_ts)
             logger.info(f"Период анализа: блоки {self.start_block} - текущий")
@@ -55,20 +56,17 @@ class GraphTraversal:
                 addr, depth = queue.popleft()
                 logger.debug(f"Обработка адреса {addr} (глубина {depth}, всего обработано {self.total_addresses})")
 
-                # Получаем исходящие переводы ETH/WETH
                 try:
                     transfers = await self._get_outgoing_transfers(addr)
                 except Exception as e:
                     logger.error(f"Ошибка получения переводов для {addr}: {e}", exc_info=True)
                     continue
 
-                # Агрегируем получателей
                 recipients = self._aggregate_recipients(transfers)
                 sorted_recs = sorted(recipients.items(), key=lambda x: x[1], reverse=True)[:MAX_BRANCHES_PER_ADDRESS]
                 logger.debug(f"Для {addr} отобрано {len(sorted_recs)} получателей")
 
                 for to_addr, total_wei in sorted_recs:
-                    # Поиск покупок получателя
                     try:
                         buys = await self._find_buys(to_addr)
                         logger.debug(f"У {to_addr} найдено {len(buys)} покупок")
@@ -87,7 +85,6 @@ class GraphTraversal:
                     except Exception as e:
                         logger.error(f"Ошибка при поиске покупок для {to_addr}: {e}", exc_info=True)
 
-                    # Добавляем в очередь, если глубина позволяет и адрес новый
                     if depth + 1 < MAX_DEPTH and to_addr not in self.visited:
                         self.visited.add(to_addr)
                         queue.append((to_addr, depth + 1))
@@ -105,11 +102,9 @@ class GraphTraversal:
             raise
 
     async def _get_outgoing_transfers(self, address: str) -> List[Dict]:
-        # Внутренние ETH
         eth_txs = await EtherscanClient.get_internal_transactions(
             self.session, address, self.start_block, self.end_block
         )
-        # WETH
         weth_txs = await EtherscanClient.get_token_transfers(
             self.session, address, contract_address=WETH_ADDRESS,
             start_block=self.start_block, end_block=self.end_block,
@@ -140,7 +135,6 @@ class GraphTraversal:
         return filtered
 
     async def _find_buys(self, address: str) -> List[Dict]:
-        # Проверка кэша
         if get_visited_address_cache(address, self.start_block):
             logger.debug(f"Адрес {address} уже проверялся после блока {self.start_block}, пропускаем запрос покупок")
             return []
