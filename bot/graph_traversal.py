@@ -43,13 +43,11 @@ class GraphTraversal:
             logger.info(f"Начало анализа для адреса {self.start_address}")
             self.request_id = create_request(self.user_id, self.chat_id, self.start_address, MAX_DEPTH)
 
-            # Получаем блок 30 дней назад
             now_ts = int(time.time())
             thirty_days_ago_ts = now_ts - LOOKBACK_DAYS * 86400
             self.start_block = await EtherscanClient.get_block_by_timestamp(self.session, thirty_days_ago_ts)
             logger.info(f"Период анализа: блоки {self.start_block} - текущий")
 
-            # BFS
             queue = deque([(self.start_address, 0)])
             self.visited.add(self.start_address)
             self.total_addresses = 1
@@ -58,17 +56,14 @@ class GraphTraversal:
                 addr, depth = queue.popleft()
                 logger.debug(f"Обработка адреса {addr} (глубина {depth}, всего обработано {self.total_addresses})")
 
-                # Получаем исходящие переводы ETH/WETH
                 try:
                     transfers = await self._get_outgoing_transfers(addr)
                 except Exception as e:
                     logger.error(f"Ошибка получения переводов для {addr}: {e}", exc_info=True)
                     continue
 
-                # Собираем блоки, в которых были исходящие переводы (для определения покупок)
                 outgoing_blocks = set()
                 for t in transfers:
-                    # В транзакциях может не быть blockNumber, но они всегда есть в ответе Etherscan
                     if 'blockNumber' in t:
                         outgoing_blocks.add(int(t['blockNumber']))
 
@@ -76,9 +71,6 @@ class GraphTraversal:
                 sorted_recs = sorted(recipients.items(), key=lambda x: x[1], reverse=True)[:MAX_BRANCHES_PER_ADDRESS]
                 logger.debug(f"Для {addr} отобрано {len(sorted_recs)} получателей")
 
-                # Анализируем покупки самого addr (исходный адрес или получатель?)
-                # Важно: мы ищем покупки как для текущего addr, так и для получателей.
-                # Сначала проверим покупки самого addr (он мог купить токены, а потом перевести ETH дальше)
                 if outgoing_blocks:
                     try:
                         buys = await self._find_buys(addr, outgoing_blocks)
@@ -98,16 +90,7 @@ class GraphTraversal:
                     except Exception as e:
                         logger.error(f"Ошибка при поиске покупок для {addr}: {e}", exc_info=True)
 
-                # Теперь для каждого получателя ищем покупки
                 for to_addr, _ in sorted_recs:
-                    # Получатели тоже могли покупать токены — проверим после получения ими средств
-                    # Но для простоты ищем покупки у всех получателей без анализа исходящих блоков,
-                    # потому что мы не знаем их историю переводов. Используем тот же принцип:
-                    # любое входящее поступление токена (кроме WETH) считается потенциальной покупкой.
-                    # Но чтобы избежать ложных срабатываний, мы можем просто искать входящие токены
-                    # и считать их покупками (это агрессивный подход). Для чистоты можно применить
-                    # ту же логику, что и для addr: получить их исходящие переводы, но это увеличит число запросов.
-                    # Пока оставим упрощённый вариант: ищем входящие токены без привязки к исходящим блокам.
                     try:
                         buys = await self._find_buys_any(to_addr)
                         logger.debug(f"У {to_addr} найдено {len(buys)} входящих токенов (потенциальные покупки)")
@@ -126,7 +109,6 @@ class GraphTraversal:
                     except Exception as e:
                         logger.error(f"Ошибка при поиске покупок для получателя {to_addr}: {e}", exc_info=True)
 
-                    # Добавляем в очередь, если глубина позволяет и адрес новый
                     if depth + 1 < MAX_DEPTH and to_addr not in self.visited:
                         self.visited.add(to_addr)
                         queue.append((to_addr, depth + 1))
@@ -144,16 +126,29 @@ class GraphTraversal:
             raise
 
     async def _get_outgoing_transfers(self, address: str) -> List[Dict]:
-        eth_txs = await EtherscanClient.get_internal_transactions(
+        # Обычные транзакции (прямые отправки ETH)
+        normal_txs = await EtherscanClient.get_normal_transactions(
             self.session, address, self.start_block, self.end_block
         )
+        # Внутренние транзакции (отправка ETH через вызовы контрактов)
+        internal_txs = await EtherscanClient.get_internal_transactions(
+            self.session, address, self.start_block, self.end_block
+        )
+        # WETH переводы
         weth_txs = await EtherscanClient.get_token_transfers(
             self.session, address, contract_address=WETH_ADDRESS,
             start_block=self.start_block, end_block=self.end_block,
             filter_by="from"
         )
+
         transfers = []
-        for tx in eth_txs:
+        for tx in normal_txs:
+            transfers.append({
+                'to': tx['to'].lower(),
+                'value_wei': int(tx['value']),
+                'blockNumber': tx['blockNumber']
+            })
+        for tx in internal_txs:
             transfers.append({
                 'to': tx['to'].lower(),
                 'value_wei': int(tx['value']),
@@ -165,7 +160,7 @@ class GraphTraversal:
                 'value_wei': int(tx['value']),
                 'blockNumber': tx['blockNumber']
             })
-        logger.debug(f"Всего исходящих переводов (ETH+WETH) для {address}: {len(transfers)}")
+        logger.debug(f"Всего исходящих переводов (обычные+внутренние+WETH) для {address}: {len(transfers)}")
         return transfers
 
     def _aggregate_recipients(self, transfers: List[Dict]) -> Dict[str, int]:
@@ -179,9 +174,6 @@ class GraphTraversal:
         return filtered
 
     async def _find_buys(self, address: str, outgoing_blocks: Set[int]) -> List[Dict]:
-        """
-        Поиск покупок: все входящие токены (не WETH) в тех же блоках, где адрес отправлял ETH/WETH.
-        """
         if get_visited_address_cache(address, self.start_block):
             logger.debug(f"Адрес {address} уже проверялся после блока {self.start_block}, пропускаем запрос покупок")
             return []
@@ -205,10 +197,6 @@ class GraphTraversal:
         return buys
 
     async def _find_buys_any(self, address: str) -> List[Dict]:
-        """
-        Поиск любых входящих токенов (кроме WETH) — для получателей, у которых мы не знаем исходящие блоки.
-        Считаем, что любое поступление токена после получения ETH — потенциальная покупка.
-        """
         if get_visited_address_cache(address, self.start_block):
             logger.debug(f"Адрес {address} уже проверялся после блока {self.start_block}, пропускаем запрос покупок")
             return []
@@ -222,7 +210,6 @@ class GraphTraversal:
         for tx in txs:
             if tx['contractAddress'].lower() == WETH_ADDRESS.lower():
                 continue
-            # Принимаем все входящие токены как покупки
             buys.append({
                 'token_address': tx['contractAddress'].lower(),
                 'tx_hash': tx['hash'],
