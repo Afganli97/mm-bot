@@ -136,9 +136,13 @@ async def run_analysis(user_id: int, chat_id: int, address: str, context: Contex
                 for addr, symbol in token_display:
                     link = f"https://dexscreener.com/ethereum/{addr}"
                     token_lines.append(f"• <a href='{link}'>{symbol}</a> (<code>{addr}</code>)")
+                limit_note = ""
+                if traversal.token_limit_reached:
+                    limit_note = "\n⚠️ <i>Достигнут лимит в 100 токенов, поиск остановлен. Показаны не все найденные токены.</i>"
                 report = (f"✅ <b>Анализ завершён!</b>\n"
                           f"Проверено адресов: {traversal.total_addresses}\n"
-                          f"Найдено уникальных токенов: {len(token_display)}\n\n"
+                          f"Найдено уникальных токенов: {len(token_display)}\n"
+                          f"{limit_note}\n"
                           + "\n".join(token_lines))
             else:
                 report = (f"✅ <b>Анализ завершён.</b>\n"
