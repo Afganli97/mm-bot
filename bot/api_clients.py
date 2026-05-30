@@ -71,6 +71,7 @@ class APIKeyRotator:
                     if resp.status == 200:
                         data = await resp.json()
                         if self.service == "etherscan":
+                            logger.info(f"Etherscan raw response: {data}")
                             if data.get("status") == "1" or data.get("message") == "OK":
                                 increment_api_usage(self.service, idx)
                                 return data
