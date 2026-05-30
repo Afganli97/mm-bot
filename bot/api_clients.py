@@ -218,13 +218,11 @@ class CoingeckoClient:
                     return json.loads(row['tokens_json'])
         url = f"{CoingeckoClient.BASE_URL}/coins/markets"
         params = {
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": 100,
-            "page": 1,
-            "sparkline": False,
-            "price_change_percentage": "24h"
-        }
+    "vs_currency": "usd",
+    "order": "market_cap_desc",
+    "per_page": 100,
+    "page": 1
+}
         async with session.get(url, params=params, timeout=30) as resp:
             if resp.status == 200:
                 data = await resp.json()
