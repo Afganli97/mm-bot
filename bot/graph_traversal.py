@@ -37,6 +37,7 @@ class GraphTraversal:
         self.visited: Set[str] = set()
         self.total_addresses = 0
         self.found_tokens = []
+        self.unique_token_addresses = set()   # для контроля уникальных токенов
         self.token_limit_reached = False
 
     async def run(self) -> List[Dict]:
@@ -53,7 +54,7 @@ class GraphTraversal:
             self.visited.add(self.start_address)
             self.total_addresses = 1
 
-            while queue and self.total_addresses < MAX_ADDRESSES_PER_TASK and len(self.found_tokens) < MAX_FOUND_TOKENS:
+            while queue and self.total_addresses < MAX_ADDRESSES_PER_TASK and len(self.unique_token_addresses) < MAX_FOUND_TOKENS:
                 addr, depth = queue.popleft()
                 logger.debug(f"Обработка адреса {addr} (глубина {depth}, всего обработано {self.total_addresses})")
 
@@ -70,23 +71,25 @@ class GraphTraversal:
                         buys = await self._find_buys(addr, outgoing_blocks)
                         logger.debug(f"У {addr} найдено {len(buys)} покупок (как отправитель)")
                         for buy in buys:
-                            if len(self.found_tokens) >= MAX_FOUND_TOKENS:
+                            if len(self.unique_token_addresses) >= MAX_FOUND_TOKENS:
                                 break
                             if not is_excluded(buy['token_address']):
-                                symbol = get_token_symbol(buy['token_address'])
-                                add_found_token(self.request_id, buy['token_address'], symbol,
-                                                addr, buy['tx_hash'], buy['block_number'])
-                                self.found_tokens.append({
-                                    'token': buy['token_address'],
-                                    'symbol': symbol,
-                                    'buyer': addr,
-                                    'tx': buy['tx_hash']
-                                })
-                                logger.info(f"Найден токен: {buy['token_address']} ({symbol}) у покупателя {addr}")
+                                if buy['token_address'] not in self.unique_token_addresses:
+                                    symbol = get_token_symbol(buy['token_address'])
+                                    add_found_token(self.request_id, buy['token_address'], symbol,
+                                                    addr, buy['tx_hash'], buy['block_number'])
+                                    self.found_tokens.append({
+                                        'token': buy['token_address'],
+                                        'symbol': symbol,
+                                        'buyer': addr,
+                                        'tx': buy['tx_hash']
+                                    })
+                                    self.unique_token_addresses.add(buy['token_address'])
+                                    logger.info(f"Найден токен: {buy['token_address']} ({symbol}) у покупателя {addr}")
                     except Exception as e:
                         logger.error(f"Ошибка при поиске покупок для {addr}: {e}", exc_info=True)
 
-                if len(self.found_tokens) >= MAX_FOUND_TOKENS:
+                if len(self.unique_token_addresses) >= MAX_FOUND_TOKENS:
                     self.token_limit_reached = True
                     break
 
@@ -97,7 +100,7 @@ class GraphTraversal:
 
                 # Для каждого получателя ищем покупки
                 for to_addr, _ in sorted_recs:
-                    if len(self.found_tokens) >= MAX_FOUND_TOKENS:
+                    if len(self.unique_token_addresses) >= MAX_FOUND_TOKENS:
                         self.token_limit_reached = True
                         break
                     if not get_visited_address_cache(to_addr, self.start_block):
@@ -107,19 +110,21 @@ class GraphTraversal:
                                 buys = await self._find_buys(to_addr, recv_blocks)
                                 logger.debug(f"У получателя {to_addr} найдено {len(buys)} покупок")
                                 for buy in buys:
-                                    if len(self.found_tokens) >= MAX_FOUND_TOKENS:
+                                    if len(self.unique_token_addresses) >= MAX_FOUND_TOKENS:
                                         break
                                     if not is_excluded(buy['token_address']):
-                                        symbol = get_token_symbol(buy['token_address'])
-                                        add_found_token(self.request_id, buy['token_address'], symbol,
-                                                        to_addr, buy['tx_hash'], buy['block_number'])
-                                        self.found_tokens.append({
-                                            'token': buy['token_address'],
-                                            'symbol': symbol,
-                                            'buyer': to_addr,
-                                            'tx': buy['tx_hash']
-                                        })
-                                        logger.info(f"Найден токен: {buy['token_address']} ({symbol}) у получателя {to_addr}")
+                                        if buy['token_address'] not in self.unique_token_addresses:
+                                            symbol = get_token_symbol(buy['token_address'])
+                                            add_found_token(self.request_id, buy['token_address'], symbol,
+                                                            to_addr, buy['tx_hash'], buy['block_number'])
+                                            self.found_tokens.append({
+                                                'token': buy['token_address'],
+                                                'symbol': symbol,
+                                                'buyer': to_addr,
+                                                'tx': buy['tx_hash']
+                                            })
+                                            self.unique_token_addresses.add(buy['token_address'])
+                                            logger.info(f"Найден токен: {buy['token_address']} ({symbol}) у получателя {to_addr}")
                             else:
                                 logger.debug(f"У получателя {to_addr} нет исходящих переводов ETH/WETH, покупки не ищем")
                         except Exception as e:
@@ -128,18 +133,18 @@ class GraphTraversal:
                         logger.debug(f"Получатель {to_addr} уже проверен ранее, пропускаем анализ покупок")
 
                     # Добавляем получателя в очередь обхода
-                    if depth + 1 < MAX_DEPTH and to_addr not in self.visited and len(self.found_tokens) < MAX_FOUND_TOKENS:
+                    if depth + 1 < MAX_DEPTH and to_addr not in self.visited and len(self.unique_token_addresses) < MAX_FOUND_TOKENS:
                         self.visited.add(to_addr)
                         queue.append((to_addr, depth + 1))
                         self.total_addresses += 1
                         update_task_progress(self.request_id, self.total_addresses)
 
-                if len(self.found_tokens) >= MAX_FOUND_TOKENS:
+                if len(self.unique_token_addresses) >= MAX_FOUND_TOKENS:
                     self.token_limit_reached = True
                     break
 
             update_request_status(self.request_id, 'done', finished=True)
-            logger.info(f"Анализ завершён. Проверено адресов: {self.total_addresses}, найдено токенов: {len(self.found_tokens)}")
+            logger.info(f"Анализ завершён. Проверено адресов: {self.total_addresses}, найдено уникальных токенов: {len(self.found_tokens)}")
             return self.found_tokens
 
         except Exception as e:
