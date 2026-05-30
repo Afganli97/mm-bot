@@ -17,6 +17,8 @@ from web3 import Web3
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+
 def is_valid_address(addr: str) -> bool:
     try:
         return Web3.is_address(addr)
@@ -87,6 +89,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Некорректный адрес от {update.effective_user.id}: {text}")
         await update.message.reply_text("❌ Некорректный адрес Ethereum. Пожалуйста, проверьте и отправьте снова.")
 
+async def _send_long_message(bot, chat_id, text: str, parse_mode="HTML", disable_web_page_preview=True):
+    """Отправляет сообщение, разбивая его на части, если длина превышает лимит Telegram."""
+    if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+        await bot.send_message(chat_id, text, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview)
+        return
+    # Разбиваем по строкам, стараясь не разрывать токен-строки
+    lines = text.split('\n')
+    chunks = []
+    current_chunk = ""
+    for line in lines:
+        # +1 для символа переноса строки
+        if len(current_chunk) + len(line) + 1 > TELEGRAM_MAX_MESSAGE_LENGTH:
+            chunks.append(current_chunk.strip())
+            current_chunk = line + "\n"
+        else:
+            current_chunk += line + "\n"
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    for chunk in chunks:
+        await bot.send_message(chat_id, chunk, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview)
+
 async def run_analysis(user_id: int, chat_id: int, address: str, context: ContextTypes.DEFAULT_TYPE):
     from aiohttp import ClientSession
     try:
@@ -104,7 +128,6 @@ async def run_analysis(user_id: int, chat_id: int, address: str, context: Contex
 
             token_display = []
             for addr, data in unique_tokens.items():
-                # Получаем символ через RPC (или из кэша если уже загружен)
                 symbol = await TokenInfoService.get_symbol(session, addr)
                 token_display.append((addr, symbol))
 
@@ -121,7 +144,8 @@ async def run_analysis(user_id: int, chat_id: int, address: str, context: Contex
                 report = (f"✅ <b>Анализ завершён.</b>\n"
                           f"Проверено адресов: {traversal.total_addresses}\n"
                           f"Токены, удовлетворяющие условиям, не найдены.")
-            await context.bot.send_message(chat_id, report, parse_mode="HTML", disable_web_page_preview=True)
+
+            await _send_long_message(context.bot, chat_id, report, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.exception("Ошибка в задаче анализа")
         await context.bot.send_message(chat_id, f"❌ Произошла ошибка: {str(e)}")
