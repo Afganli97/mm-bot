@@ -100,7 +100,7 @@ etherscan_rotator = APIKeyRotator(ETHERSCAN_API_KEYS, "etherscan", ETHERSCAN_DAI
 
 class EtherscanClient:
     """Асинхронные методы для Etherscan API."""
-    BASE_URL = "https://api.etherscan.io/api"
+    BASE_URL = "https://api.etherscan.io/v2/api"
 
     @staticmethod
     async def get_block_by_timestamp(session: aiohttp.ClientSession, timestamp: int) -> int:
