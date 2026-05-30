@@ -1,7 +1,7 @@
 """
 Основной алгоритм обхода адресов и поиска покупок.
-Покупка = получение токена (не WETH) в блоке, где этот же адрес отправил ETH/WETH.
-Для каждого адреса загружаются его исходящие ETH/WETH, затем входящие токены в тех же блоках.
+Покупка определяется как получение любого токена (кроме WETH) в блоке,
+в котором адрес отправил ETH или WETH.
 """
 import asyncio
 import logging
@@ -12,7 +12,7 @@ import aiohttp
 
 from bot.config import (
     MAX_DEPTH, MAX_BRANCHES_PER_ADDRESS, LOOKBACK_DAYS,
-    MIN_TRANSFER_VALUE_ETH, MAX_ADDRESSES_PER_TASK,
+    MIN_TRANSFER_VALUE_ETH, MAX_ADDRESSES_PER_TASK, MAX_FOUND_TOKENS,
     WETH_ADDRESS, DEX_ROUTERS
 )
 from bot.database import (
@@ -37,6 +37,7 @@ class GraphTraversal:
         self.visited: Set[str] = set()
         self.total_addresses = 0
         self.found_tokens = []
+        self.token_limit_reached = False
 
     async def run(self) -> List[Dict]:
         try:
@@ -52,23 +53,25 @@ class GraphTraversal:
             self.visited.add(self.start_address)
             self.total_addresses = 1
 
-            while queue and self.total_addresses < MAX_ADDRESSES_PER_TASK:
+            while queue and self.total_addresses < MAX_ADDRESSES_PER_TASK and len(self.found_tokens) < MAX_FOUND_TOKENS:
                 addr, depth = queue.popleft()
                 logger.debug(f"Обработка адреса {addr} (глубина {depth}, всего обработано {self.total_addresses})")
 
-                # 1. Получаем исходящие переводы (обычные + внутренние + WETH) текущего адреса
+                # Получаем исходящие переводы ETH/WETH
                 try:
                     transfers, outgoing_blocks = await self._get_outgoing_transfers_and_blocks(addr)
                 except Exception as e:
                     logger.error(f"Ошибка получения переводов для {addr}: {e}", exc_info=True)
                     continue
 
-                # 2. Анализируем покупки самого addr (если ещё не проверяли)
+                # Анализируем покупки самого addr
                 if outgoing_blocks and not get_visited_address_cache(addr, self.start_block):
                     try:
                         buys = await self._find_buys(addr, outgoing_blocks)
                         logger.debug(f"У {addr} найдено {len(buys)} покупок (как отправитель)")
                         for buy in buys:
+                            if len(self.found_tokens) >= MAX_FOUND_TOKENS:
+                                break
                             if not is_excluded(buy['token_address']):
                                 symbol = get_token_symbol(buy['token_address'])
                                 add_found_token(self.request_id, buy['token_address'], symbol,
@@ -82,24 +85,30 @@ class GraphTraversal:
                                 logger.info(f"Найден токен: {buy['token_address']} ({symbol}) у покупателя {addr}")
                     except Exception as e:
                         logger.error(f"Ошибка при поиске покупок для {addr}: {e}", exc_info=True)
-                else:
-                    logger.debug(f"Адрес {addr} уже проверялся или нет исходящих блоков, пропускаем поиск покупок")
 
-                # 3. Агрегируем получателей и фильтруем
+                if len(self.found_tokens) >= MAX_FOUND_TOKENS:
+                    self.token_limit_reached = True
+                    break
+
+                # Получатели и фильтрация
                 recipients = self._aggregate_recipients(transfers)
                 sorted_recs = sorted(recipients.items(), key=lambda x: x[1], reverse=True)[:MAX_BRANCHES_PER_ADDRESS]
                 logger.debug(f"Для {addr} отобрано {len(sorted_recs)} получателей")
 
-                # 4. Для каждого получателя также загружаем его исходящие переводы и ищем покупки
+                # Для каждого получателя ищем покупки
                 for to_addr, _ in sorted_recs:
+                    if len(self.found_tokens) >= MAX_FOUND_TOKENS:
+                        self.token_limit_reached = True
+                        break
                     if not get_visited_address_cache(to_addr, self.start_block):
-                        # Получатель ещё не анализировался – загрузим его исходящие переводы
                         try:
                             _, recv_blocks = await self._get_outgoing_transfers_and_blocks(to_addr)
                             if recv_blocks:
                                 buys = await self._find_buys(to_addr, recv_blocks)
                                 logger.debug(f"У получателя {to_addr} найдено {len(buys)} покупок")
                                 for buy in buys:
+                                    if len(self.found_tokens) >= MAX_FOUND_TOKENS:
+                                        break
                                     if not is_excluded(buy['token_address']):
                                         symbol = get_token_symbol(buy['token_address'])
                                         add_found_token(self.request_id, buy['token_address'], symbol,
@@ -118,12 +127,16 @@ class GraphTraversal:
                     else:
                         logger.debug(f"Получатель {to_addr} уже проверен ранее, пропускаем анализ покупок")
 
-                    # 5. Добавляем получателя в очередь обхода (если не посещён)
-                    if depth + 1 < MAX_DEPTH and to_addr not in self.visited:
+                    # Добавляем получателя в очередь обхода
+                    if depth + 1 < MAX_DEPTH and to_addr not in self.visited and len(self.found_tokens) < MAX_FOUND_TOKENS:
                         self.visited.add(to_addr)
                         queue.append((to_addr, depth + 1))
                         self.total_addresses += 1
                         update_task_progress(self.request_id, self.total_addresses)
+
+                if len(self.found_tokens) >= MAX_FOUND_TOKENS:
+                    self.token_limit_reached = True
+                    break
 
             update_request_status(self.request_id, 'done', finished=True)
             logger.info(f"Анализ завершён. Проверено адресов: {self.total_addresses}, найдено токенов: {len(self.found_tokens)}")
@@ -136,19 +149,12 @@ class GraphTraversal:
             raise
 
     async def _get_outgoing_transfers_and_blocks(self, address: str) -> (List[Dict], Set[int]):
-        """
-        Возвращает список исходящих переводов (для агрегации получателей)
-        и множество номеров блоков, в которых были исходящие переводы (для определения покупок).
-        """
-        # Обычные транзакции
         normal_txs = await EtherscanClient.get_normal_transactions(
             self.session, address, self.start_block, self.end_block
         )
-        # Внутренние транзакции
         internal_txs = await EtherscanClient.get_internal_transactions(
             self.session, address, self.start_block, self.end_block
         )
-        # WETH переводы
         weth_txs = await EtherscanClient.get_token_transfers(
             self.session, address, contract_address=WETH_ADDRESS,
             start_block=self.start_block, end_block=self.end_block,
@@ -196,9 +202,6 @@ class GraphTraversal:
         return filtered
 
     async def _find_buys(self, address: str, outgoing_blocks: Set[int]) -> List[Dict]:
-        """
-        Ищет входящие токены (не WETH) в блоках, где адрес отправлял ETH/WETH.
-        """
         txs = await EtherscanClient.get_token_transfers(
             self.session, address,
             start_block=self.start_block, end_block=self.end_block,
@@ -214,6 +217,5 @@ class GraphTraversal:
                     'tx_hash': tx['hash'],
                     'block_number': int(tx['blockNumber'])
                 })
-        # Помечаем адрес как проверенный (сохраняем start_block в кэш)
         set_visited_address_cache(address, self.start_block)
         return buys
