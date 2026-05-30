@@ -12,6 +12,7 @@ from bot.config import TELEGRAM_BOT_TOKEN, MAX_DEPTH, ALLOWED_USER_IDS
 from bot.database import get_all_api_usage, get_connection
 from bot.graph_traversal import GraphTraversal
 from bot.token_filter import update_top_tokens
+from bot.api_clients import TokenInfoService
 from web3 import Web3
 
 logger = logging.getLogger(__name__)
@@ -93,13 +94,28 @@ async def run_analysis(user_id: int, chat_id: int, address: str, context: Contex
             await update_top_tokens(session)
             traversal = GraphTraversal(session, address, user_id, chat_id)
             found = await traversal.run()
-            if found:
+
+            # Собираем уникальные токены
+            unique_tokens = {}
+            for item in found:
+                token = item['token']
+                if token not in unique_tokens:
+                    unique_tokens[token] = item
+
+            token_display = []
+            for addr, data in unique_tokens.items():
+                # Получаем символ через RPC (или из кэша если уже загружен)
+                symbol = await TokenInfoService.get_symbol(session, addr)
+                token_display.append((addr, symbol))
+
+            if token_display:
                 token_lines = []
-                for item in found:
-                    token_lines.append(f"• <code>{item['token']}</code> ({item['symbol']}) — покупатель: <code>{item['buyer']}</code>")
+                for addr, symbol in token_display:
+                    link = f"https://dexscreener.com/ethereum/{addr}"
+                    token_lines.append(f"• <a href='{link}'>{symbol}</a> (<code>{addr}</code>)")
                 report = (f"✅ <b>Анализ завершён!</b>\n"
                           f"Проверено адресов: {traversal.total_addresses}\n"
-                          f"Найдено уникальных токенов: {len(found)}\n\n"
+                          f"Найдено уникальных токенов: {len(token_display)}\n\n"
                           + "\n".join(token_lines))
             else:
                 report = (f"✅ <b>Анализ завершён.</b>\n"
@@ -108,6 +124,4 @@ async def run_analysis(user_id: int, chat_id: int, address: str, context: Contex
             await context.bot.send_message(chat_id, report, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.exception("Ошибка в задаче анализа")
-        # Отправляем детали ошибки в чат
-        error_msg = f"❌ Произошла ошибка: {str(e)}"
-        await context.bot.send_message(chat_id, error_msg)
+        await context.bot.send_message(chat_id, f"❌ Произошла ошибка: {str(e)}")
