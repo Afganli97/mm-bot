@@ -227,6 +227,38 @@ class EtherscanClient:
         logger.debug(f"Найдено {len(all_txs)} токен-транзакций для {address} (фильтр: {filter_by})")
         return all_txs
 
+class TokenInfoService:
+    """Получение символа токена через RPC-вызов к контракту."""
+    @staticmethod
+    async def get_symbol(session: aiohttp.ClientSession, token_address: str) -> str:
+        """Возвращает символ токена, используя Alchemy/Infura RPC."""
+        rpc_url = ALCHEMY_URL or INFURA_URL
+        if not rpc_url:
+            logger.warning("Нет доступного RPC URL для получения символа токена")
+            return "?"
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": token_address, "data": "0x95d89b41"}, "latest"],
+            "id": 1
+        }
+        try:
+            async with session.post(rpc_url, json=payload, timeout=10) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    if 'result' in result and result['result'] != '0x':
+                        hex_str = result['result'][2:]
+                        try:
+                            symbol = bytes.fromhex(hex_str).decode('utf-8').rstrip('\x00')
+                            if symbol:
+                                return symbol
+                        except Exception:
+                            pass
+                logger.warning(f"Не удалось получить символ для {token_address}")
+        except Exception as e:
+            logger.warning(f"Ошибка RPC при получении символа для {token_address}: {e}")
+        return "?"
+
 class AlchemyClient:
     @staticmethod
     async def get_logs(session: aiohttp.ClientSession, params: dict) -> dict:
