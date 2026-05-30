@@ -51,6 +51,10 @@ class APIKeyRotator:
         return None
 
     async def make_request(self, session: aiohttp.ClientSession, url: str, params: dict = None) -> dict:
+        # Соблюдаем лимит Etherscan (не более 3 запросов в секунду)
+        if self.service == "etherscan":
+            await asyncio.sleep(0.4)
+
         for attempt in range(len(self.keys)):
             key_info = self.get_available_key()
             if not key_info:
@@ -145,7 +149,6 @@ class EtherscanClient:
             if len(txs) < 1000:
                 break
             page += 1
-        # Фильтруем исходящие успешные с ненулевой value
         filtered = []
         for tx in all_txs:
             if (tx["from"].lower() == address.lower() and
