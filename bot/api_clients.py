@@ -17,9 +17,8 @@ from bot.database import increment_api_usage, get_api_usage_today
 
 logger = logging.getLogger(__name__)
 
-# Лимиты запросов в сутки
 ETHERSCAN_DAILY_LIMIT = 100_000
-ALCHEMY_DAILY_LIMIT_CU = 300_000_000  # условно, 1 запрос = 1 CU
+ALCHEMY_DAILY_LIMIT_CU = 300_000_000
 INFURA_DAILY_LIMIT = 100_000
 COINGECKO_LIMIT_PER_MINUTE = 10
 
@@ -31,7 +30,6 @@ class APIKeyRotator:
         self.daily_limit = daily_limit
 
     def _reset_old_if_needed(self, key_index: int):
-        """Удаляет записи об использовании ключа за старые даты."""
         from datetime import date
         from bot.database import get_connection
         today = date.today().isoformat()
@@ -44,7 +42,6 @@ class APIKeyRotator:
             logger.debug(f"Сброшены старые счётчики для {self.service} ключ {key_index}")
 
     def get_available_key(self) -> Optional[tuple]:
-        """Возвращает (key, index) первый неисчерпанный ключ, или None."""
         for i, key in enumerate(self.keys):
             self._reset_old_if_needed(i)
             used = get_api_usage_today(self.service, i)
@@ -54,7 +51,6 @@ class APIKeyRotator:
         return None
 
     async def make_request(self, session: aiohttp.ClientSession, url: str, params: dict = None) -> dict:
-        """GET-запрос с ротацией ключей и учётом лимитов."""
         for attempt in range(len(self.keys)):
             key_info = self.get_available_key()
             if not key_info:
@@ -68,7 +64,6 @@ class APIKeyRotator:
                 params["chainid"] = 1
 
             logger.debug(f"Запрос к {self.service} (ключ {idx}): URL={url}, params={params}")
-
             try:
                 async with session.get(url, params=params, timeout=30) as resp:
                     if resp.status == 200:
@@ -76,6 +71,10 @@ class APIKeyRotator:
                         logger.debug(f"Ответ {self.service}: {data}")
 
                         if self.service == "etherscan":
+                            # Пустой ответ — не ошибка
+                            if data.get("message") == "No transactions found" or data.get("message") == "No records found":
+                                increment_api_usage(self.service, idx)
+                                return {"status": "1", "message": "OK", "result": []}
                             if data.get("status") == "1" or data.get("message") == "OK":
                                 increment_api_usage(self.service, idx)
                                 return data
@@ -101,11 +100,9 @@ class APIKeyRotator:
                 raise
         raise Exception("Все попытки запроса исчерпаны")
 
-# Инициализация ротатора
 etherscan_rotator = APIKeyRotator(ETHERSCAN_API_KEYS, "etherscan", ETHERSCAN_DAILY_LIMIT)
 
 class EtherscanClient:
-    """Асинхронные методы для Etherscan API."""
     BASE_URL = "https://api.etherscan.io/v2/api"
 
     @staticmethod
@@ -121,6 +118,42 @@ class EtherscanClient:
         block = int(data["result"])
         logger.info(f"Блок 30-дневной давности: {block}")
         return block
+
+    @staticmethod
+    async def get_normal_transactions(session: aiohttp.ClientSession, address: str,
+                                      start_block: int, end_block: int) -> List[Dict]:
+        """Обычные транзакции (не внутренние). Ищем исходящие переводы ETH."""
+        logger.debug(f"Запрос обычных транзакций для {address} с блока {start_block} по {end_block}")
+        all_txs = []
+        page = 1
+        while True:
+            params = {
+                "module": "account",
+                "action": "txlist",
+                "address": address,
+                "startblock": start_block,
+                "endblock": end_block,
+                "page": page,
+                "offset": 1000,
+                "sort": "asc"
+            }
+            data = await etherscan_rotator.make_request(session, EtherscanClient.BASE_URL, params)
+            txs = data.get("result", [])
+            if not txs:
+                break
+            all_txs.extend(txs)
+            if len(txs) < 1000:
+                break
+            page += 1
+        # Фильтруем исходящие успешные с ненулевой value
+        filtered = []
+        for tx in all_txs:
+            if (tx["from"].lower() == address.lower() and
+                int(tx.get("isError", "0")) == 0 and
+                int(tx["value"]) > 0):
+                filtered.append(tx)
+        logger.debug(f"Найдено {len(filtered)} исходящих обычных ETH-переводов для {address}")
+        return filtered
 
     @staticmethod
     async def get_internal_transactions(session: aiohttp.ClientSession, address: str,
@@ -192,7 +225,6 @@ class EtherscanClient:
         return all_txs
 
 class AlchemyClient:
-    """Обёртка для Alchemy RPC."""
     @staticmethod
     async def get_logs(session: aiohttp.ClientSession, params: dict) -> dict:
         logger.debug(f"Alchemy getLogs: {params}")
@@ -209,7 +241,6 @@ class AlchemyClient:
                 raise Exception(f"Alchemy HTTP {resp.status}")
 
 class InfuraClient:
-    """Резервный Infura RPC."""
     @staticmethod
     async def get_logs(session: aiohttp.ClientSession, params: dict) -> dict:
         logger.debug(f"Infura getLogs: {params}")
@@ -226,7 +257,6 @@ class InfuraClient:
                 raise Exception(f"Infura HTTP {resp.status}")
 
 class CoingeckoClient:
-    """Получение списка топ-100 монет."""
     BASE_URL = "https://api.coingecko.com/api/v3"
 
     @staticmethod
@@ -234,7 +264,6 @@ class CoingeckoClient:
         from bot.database import get_connection
         from datetime import timedelta
         import json
-
         logger.info("Загрузка топ-100 токенов с CoinGecko...")
         with get_connection() as conn:
             row = conn.execute("SELECT tokens_json, updated_at FROM top_tokens_cache WHERE id=1").fetchone()
