@@ -19,20 +19,19 @@ logger = logging.getLogger(__name__)
 
 # Лимиты запросов в сутки
 ETHERSCAN_DAILY_LIMIT = 100_000
-ALCHEMY_DAILY_LIMIT_CU = 300_000_000  # условно, будем считать 1 запрос = 1 CU
+ALCHEMY_DAILY_LIMIT_CU = 300_000_000  # условно, 1 запрос = 1 CU
 INFURA_DAILY_LIMIT = 100_000
 COINGECKO_LIMIT_PER_MINUTE = 10
 
 class APIKeyRotator:
-    """Простая ротация ключей с подсчётом использования."""
+    """Ротация ключей с учётом использования."""
     def __init__(self, keys: List[str], service: str, daily_limit: int):
         self.keys = keys
         self.service = service
         self.daily_limit = daily_limit
-        # Сброс старых счётчиков перенесён в get_available_key, чтобы не требовать готовой БД при импорте
 
     def _reset_old_if_needed(self, key_index: int):
-        """Удаляет устаревшие записи для указанного ключа (не сегодняшние)."""
+        """Удаляет записи об использовании ключа за старые даты."""
         from datetime import date
         from bot.database import get_connection
         today = date.today().isoformat()
@@ -42,62 +41,67 @@ class APIKeyRotator:
                 (self.service, key_index, today)
             )
             conn.commit()
+            logger.debug(f"Сброшены старые счётчики для {self.service} ключ {key_index}")
 
     def get_available_key(self) -> Optional[tuple]:
         """Возвращает (key, index) первый неисчерпанный ключ, или None."""
         for i, key in enumerate(self.keys):
-            # Сбросим старые записи перед проверкой
             self._reset_old_if_needed(i)
             used = get_api_usage_today(self.service, i)
+            logger.debug(f"{self.service} ключ {i}: использовано {used}/{self.daily_limit}")
             if used < self.daily_limit:
                 return key, i
         return None
 
     async def make_request(self, session: aiohttp.ClientSession, url: str, params: dict = None) -> dict:
-        """Выполняет GET-запрос с учётом лимита и ротации."""
+        """GET-запрос с ротацией ключей и учётом лимитов."""
         for attempt in range(len(self.keys)):
             key_info = self.get_available_key()
             if not key_info:
                 logger.error(f"Все ключи сервиса {self.service} исчерпаны на сегодня")
                 raise Exception(f"Дневной лимит API {self.service} исчерпан")
             key, idx = key_info
-            # Для Etherscan ключ передаётся в params
+
             if self.service == "etherscan":
                 params = params or {}
                 params["apikey"] = key
                 params["chainid"] = 1
+
+            logger.debug(f"Запрос к {self.service} (ключ {idx}): URL={url}, params={params}")
+
             try:
                 async with session.get(url, params=params, timeout=30) as resp:
                     if resp.status == 200:
                         data = await resp.json()
+                        logger.debug(f"Ответ {self.service}: {data}")
+
                         if self.service == "etherscan":
-                            logger.info(f"Etherscan raw response: {data}")
                             if data.get("status") == "1" or data.get("message") == "OK":
                                 increment_api_usage(self.service, idx)
                                 return data
-                            elif data.get("message") == "NOTOK" and "limit" in data.get("result", ""):
-                                logger.warning(f"Etherscan ключ {idx} достиг лимита")
+                            elif data.get("message") == "NOTOK" and "limit" in data.get("result", "").lower():
+                                logger.warning(f"Etherscan ключ {idx} исчерпал лимит")
                                 continue
                             else:
                                 logger.error(f"Etherscan ошибка: {data}")
-                                raise Exception(data.get("message", "Ошибка Etherscan"))
+                                raise Exception(f"Etherscan: {data.get('result', 'Неизвестная ошибка')}")
                         else:
                             increment_api_usage(self.service, idx)
                             return data
                     elif resp.status == 429:
-                        logger.warning(f"429 Too Many Requests, пробуем следующий ключ")
+                        logger.warning(f"429 от {self.service}, пробуем следующий ключ")
                         await asyncio.sleep(1)
                         continue
                     else:
                         text = await resp.text()
-                        logger.error(f"HTTP {resp.status}: {text}")
-                        raise Exception(f"HTTP {resp.status}")
+                        logger.error(f"HTTP {resp.status} от {self.service}: {text}")
+                        raise Exception(f"HTTP {resp.status} от {self.service}")
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.error(f"Ошибка сети: {e}")
+                logger.error(f"Сетевая ошибка при запросе к {self.service}: {e}")
                 raise
         raise Exception("Все попытки запроса исчерпаны")
 
-# Инициализация ротатора (теперь безопасно, БД не требуется)
+# Инициализация ротатора
 etherscan_rotator = APIKeyRotator(ETHERSCAN_API_KEYS, "etherscan", ETHERSCAN_DAILY_LIMIT)
 
 class EtherscanClient:
@@ -106,6 +110,7 @@ class EtherscanClient:
 
     @staticmethod
     async def get_block_by_timestamp(session: aiohttp.ClientSession, timestamp: int) -> int:
+        logger.info(f"Получение блока по timestamp {timestamp}")
         params = {
             "module": "block",
             "action": "getblocknobytime",
@@ -113,11 +118,14 @@ class EtherscanClient:
             "closest": "before"
         }
         data = await etherscan_rotator.make_request(session, EtherscanClient.BASE_URL, params)
-        return int(data["result"])
+        block = int(data["result"])
+        logger.info(f"Блок 30-дневной давности: {block}")
+        return block
 
     @staticmethod
     async def get_internal_transactions(session: aiohttp.ClientSession, address: str,
                                         start_block: int, end_block: int) -> List[Dict]:
+        logger.debug(f"Запрос внутренних транзакций для {address} с блока {start_block} по {end_block}")
         all_txs = []
         page = 1
         while True:
@@ -145,6 +153,7 @@ class EtherscanClient:
                 int(tx["isError"]) == 0 and
                 int(tx["value"]) > 0):
                 filtered.append(tx)
+        logger.debug(f"Найдено {len(filtered)} исходящих внутренних ETH-переводов для {address}")
         return filtered
 
     @staticmethod
@@ -152,6 +161,8 @@ class EtherscanClient:
                                   contract_address: str = None,
                                   start_block: int = 0, end_block: int = 99999999,
                                   filter_by: str = None) -> List[Dict]:
+        logger.debug(f"Запрос токен-транзакций для {address}, контракт={contract_address}, "
+                     f"блоки {start_block}-{end_block}, фильтр={filter_by}")
         all_txs = []
         page = 1
         while True:
@@ -177,30 +188,41 @@ class EtherscanClient:
             page += 1
         if filter_by:
             all_txs = [tx for tx in all_txs if tx[filter_by].lower() == address.lower()]
+        logger.debug(f"Найдено {len(all_txs)} токен-транзакций для {address} (фильтр: {filter_by})")
         return all_txs
 
 class AlchemyClient:
     """Обёртка для Alchemy RPC."""
     @staticmethod
     async def get_logs(session: aiohttp.ClientSession, params: dict) -> dict:
+        logger.debug(f"Alchemy getLogs: {params}")
         url = ALCHEMY_URL
         async with session.post(url, json=params, timeout=30) as resp:
             if resp.status == 200:
+                data = await resp.json()
+                logger.debug(f"Alchemy ответ: {len(data.get('result', []))} логов")
                 increment_api_usage("alchemy", 0)
-                return await resp.json()
+                return data
             else:
+                text = await resp.text()
+                logger.error(f"Alchemy HTTP {resp.status}: {text}")
                 raise Exception(f"Alchemy HTTP {resp.status}")
 
 class InfuraClient:
     """Резервный Infura RPC."""
     @staticmethod
     async def get_logs(session: aiohttp.ClientSession, params: dict) -> dict:
+        logger.debug(f"Infura getLogs: {params}")
         url = INFURA_URL
         async with session.post(url, json=params, timeout=30) as resp:
             if resp.status == 200:
+                data = await resp.json()
+                logger.debug(f"Infura ответ: {len(data.get('result', []))} логов")
                 increment_api_usage("infura", 0)
-                return await resp.json()
+                return data
             else:
+                text = await resp.text()
+                logger.error(f"Infura HTTP {resp.status}: {text}")
                 raise Exception(f"Infura HTTP {resp.status}")
 
 class CoingeckoClient:
@@ -212,12 +234,16 @@ class CoingeckoClient:
         from bot.database import get_connection
         from datetime import timedelta
         import json
+
+        logger.info("Загрузка топ-100 токенов с CoinGecko...")
         with get_connection() as conn:
             row = conn.execute("SELECT tokens_json, updated_at FROM top_tokens_cache WHERE id=1").fetchone()
             if row:
                 updated = datetime.fromisoformat(row['updated_at'])
                 if (datetime.utcnow() - updated) < timedelta(hours=1):
+                    logger.debug("Использован кэш топ-100 токенов")
                     return json.loads(row['tokens_json'])
+
         url = f"{CoingeckoClient.BASE_URL}/coins/markets"
         params = {
             "vs_currency": "usd",
@@ -237,6 +263,7 @@ class CoingeckoClient:
                             "symbol": coin["symbol"].upper(),
                             "address": eth_addr.lower()
                         })
+                logger.info(f"Получено {len(tokens)} токенов из топ-100")
                 with get_connection() as conn:
                     conn.execute(
                         "INSERT OR REPLACE INTO top_tokens_cache (id, updated_at, tokens_json) VALUES (1, ?, ?)",
@@ -245,5 +272,6 @@ class CoingeckoClient:
                     conn.commit()
                 return tokens
             else:
-                logger.error(f"Coingecko HTTP {resp.status}")
-                raise Exception("Не удалось получить топ-100 с Coingecko")
+                text = await resp.text()
+                logger.error(f"CoinGecko HTTP {resp.status}: {text}")
+                raise Exception("Не удалось получить топ-100 с CoinGecko")
