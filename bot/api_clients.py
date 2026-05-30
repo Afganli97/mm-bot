@@ -13,7 +13,7 @@ from bot.config import (
     WETH_ADDRESS, DEX_ROUTERS, LOOKBACK_DAYS,
     MIN_TRANSFER_VALUE_ETH, MAX_BRANCHES_PER_ADDRESS
 )
-from bot.database import increment_api_usage, get_api_usage_today, reset_daily_counters_if_needed
+from bot.database import increment_api_usage, get_api_usage_today
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +29,25 @@ class APIKeyRotator:
         self.keys = keys
         self.service = service
         self.daily_limit = daily_limit
-        # Сброс старых счетчиков при инициализации
-        for i in range(len(keys)):
-            reset_daily_counters_if_needed(service, i)
+        # Сброс старых счётчиков перенесён в get_available_key, чтобы не требовать готовой БД при импорте
+
+    def _reset_old_if_needed(self, key_index: int):
+        """Удаляет устаревшие записи для указанного ключа (не сегодняшние)."""
+        from datetime import date
+        from bot.database import get_connection
+        today = date.today().isoformat()
+        with get_connection() as conn:
+            conn.execute(
+                "DELETE FROM api_usage WHERE service=? AND key_index=? AND usage_date != ?",
+                (self.service, key_index, today)
+            )
+            conn.commit()
 
     def get_available_key(self) -> Optional[tuple]:
         """Возвращает (key, index) первый неисчерпанный ключ, или None."""
         for i, key in enumerate(self.keys):
+            # Сбросим старые записи перед проверкой
+            self._reset_old_if_needed(i)
             used = get_api_usage_today(self.service, i)
             if used < self.daily_limit:
                 return key, i
@@ -53,20 +65,16 @@ class APIKeyRotator:
             if self.service == "etherscan":
                 params = params or {}
                 params["apikey"] = key
-            # Для Alchemy/Infura ключ уже в URL
             try:
                 async with session.get(url, params=params, timeout=30) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        # Etherscan возвращает статус в JSON
                         if self.service == "etherscan":
                             if data.get("status") == "1" or data.get("message") == "OK":
                                 increment_api_usage(self.service, idx)
                                 return data
                             elif data.get("message") == "NOTOK" and "limit" in data.get("result", ""):
                                 logger.warning(f"Etherscan ключ {idx} достиг лимита")
-                                # Принудительно установим использованный лимит, чтобы больше не пытаться
-                                # Просто перейдём к следующему ключу
                                 continue
                             else:
                                 logger.error(f"Etherscan ошибка: {data}")
@@ -75,7 +83,7 @@ class APIKeyRotator:
                             increment_api_usage(self.service, idx)
                             return data
                     elif resp.status == 429:
-                        logger.warning(f"Слишком много запросов ({resp.status}), пробуем следующий ключ")
+                        logger.warning(f"429 Too Many Requests, пробуем следующий ключ")
                         await asyncio.sleep(1)
                         continue
                     else:
@@ -87,7 +95,7 @@ class APIKeyRotator:
                 raise
         raise Exception("Все попытки запроса исчерпаны")
 
-# Инициализация ротаторов
+# Инициализация ротатора (теперь безопасно, БД не требуется)
 etherscan_rotator = APIKeyRotator(ETHERSCAN_API_KEYS, "etherscan", ETHERSCAN_DAILY_LIMIT)
 
 class EtherscanClient:
@@ -96,7 +104,6 @@ class EtherscanClient:
 
     @staticmethod
     async def get_block_by_timestamp(session: aiohttp.ClientSession, timestamp: int) -> int:
-        """Возвращает номер ближайшего блока к заданному Unix timestamp (секунды)."""
         params = {
             "module": "block",
             "action": "getblocknobytime",
@@ -109,7 +116,6 @@ class EtherscanClient:
     @staticmethod
     async def get_internal_transactions(session: aiohttp.ClientSession, address: str,
                                         start_block: int, end_block: int) -> List[Dict]:
-        """Внутренние транзакции ETH, где address является отправителем (from)."""
         all_txs = []
         page = 1
         while True:
@@ -131,7 +137,6 @@ class EtherscanClient:
             if len(txs) < 1000:
                 break
             page += 1
-        # Фильтруем только исходящие от address, успешные, с ненулевой value
         filtered = []
         for tx in all_txs:
             if (tx["from"].lower() == address.lower() and
@@ -145,10 +150,6 @@ class EtherscanClient:
                                   contract_address: str = None,
                                   start_block: int = 0, end_block: int = 99999999,
                                   filter_by: str = None) -> List[Dict]:
-        """
-        Транзакции токенов ERC-20.
-        filter_by: 'from' или 'to' — если указано, возвращает только те, где адрес участвует в этой роли.
-        """
         all_txs = []
         page = 1
         while True:
@@ -183,7 +184,7 @@ class AlchemyClient:
         url = ALCHEMY_URL
         async with session.post(url, json=params, timeout=30) as resp:
             if resp.status == 200:
-                increment_api_usage("alchemy", 0)  # один ключ
+                increment_api_usage("alchemy", 0)
                 return await resp.json()
             else:
                 raise Exception(f"Alchemy HTTP {resp.status}")
@@ -206,21 +207,15 @@ class CoingeckoClient:
 
     @staticmethod
     async def get_top_100(session: aiohttp.ClientSession) -> List[Dict]:
-        """
-        Возвращает список монет (id, symbol, platforms.ethereum).
-        Кэшируется в БД на 1 час.
-        """
         from bot.database import get_connection
         from datetime import timedelta
-        # Проверим кэш
+        import json
         with get_connection() as conn:
             row = conn.execute("SELECT tokens_json, updated_at FROM top_tokens_cache WHERE id=1").fetchone()
             if row:
                 updated = datetime.fromisoformat(row['updated_at'])
                 if (datetime.utcnow() - updated) < timedelta(hours=1):
-                    import json
                     return json.loads(row['tokens_json'])
-        # Запрос к Coingecko
         url = f"{CoingeckoClient.BASE_URL}/coins/markets"
         params = {
             "vs_currency": "usd",
@@ -233,7 +228,6 @@ class CoingeckoClient:
         async with session.get(url, params=params, timeout=30) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                # Извлечём адреса Ethereum-контрактов
                 tokens = []
                 for coin in data:
                     eth_addr = coin.get("platforms", {}).get("ethereum", "")
@@ -243,8 +237,6 @@ class CoingeckoClient:
                             "symbol": coin["symbol"].upper(),
                             "address": eth_addr.lower()
                         })
-                # Сохраним в кэш
-                import json
                 with get_connection() as conn:
                     conn.execute(
                         "INSERT OR REPLACE INTO top_tokens_cache (id, updated_at, tokens_json) VALUES (1, ?, ?)",
