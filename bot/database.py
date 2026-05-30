@@ -12,11 +12,9 @@ from bot.config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-# Убедимся, что папка data существует
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 def init_db():
-    """Создание таблиц, если их нет."""
     with get_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS requests (
@@ -81,7 +79,6 @@ def init_db():
 
 @contextmanager
 def get_connection():
-    """Контекстный менеджер для соединения с БД."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
@@ -90,7 +87,6 @@ def get_connection():
         conn.close()
 
 def create_request(user_id: int, chat_id: int, address: str, depth: int) -> int:
-    """Создаёт новую задачу анализа, возвращает её ID."""
     with get_connection() as conn:
         cur = conn.execute(
             "INSERT INTO requests (user_id, chat_id, address, depth_used, status, started_at) VALUES (?, ?, ?, ?, 'running', ?)",
@@ -99,13 +95,13 @@ def create_request(user_id: int, chat_id: int, address: str, depth: int) -> int:
         request_id = cur.lastrowid
         conn.execute(
             "INSERT INTO task_progress (request_id, processed_addresses, max_addresses, status) VALUES (?, 0, ?, 'running')",
-            (request_id, depth * 10)  # заглушка, обновим позже
+            (request_id, depth * 10)
         )
         conn.commit()
+        logger.debug(f"Создана задача {request_id} для адреса {address}")
         return request_id
 
 def update_request_status(request_id: int, status: str, error_message: str = None, finished: bool = False):
-    """Обновляет статус задачи."""
     with get_connection() as conn:
         if finished:
             conn.execute(
@@ -118,38 +114,35 @@ def update_request_status(request_id: int, status: str, error_message: str = Non
                 (status, error_message, request_id)
             )
         conn.commit()
+        logger.debug(f"Задача {request_id}: статус={status}, ошибка={error_message}")
 
 def add_found_token(request_id: int, token_address: str, token_symbol: str, buyer_address: str, tx_hash: str, block_number: int):
-    """Сохраняет найденный токен."""
     with get_connection() as conn:
         conn.execute(
             "INSERT INTO found_tokens (request_id, token_address, token_symbol, buyer_address, tx_hash, block_number) VALUES (?, ?, ?, ?, ?, ?)",
             (request_id, token_address, token_symbol, buyer_address, tx_hash, block_number)
         )
         conn.commit()
+        logger.debug(f"Добавлен токен {token_address} в задачу {request_id}")
 
 def get_visited_address_cache(address: str, min_block: int) -> bool:
-    """Проверяет, есть ли свежий кэш для адреса (за блок >= min_block)."""
     with get_connection() as conn:
         row = conn.execute(
             "SELECT last_checked_block FROM visited_addresses WHERE address=?",
             (address,)
         ).fetchone()
-        if row and row['last_checked_block'] and row['last_checked_block'] >= min_block:
-            return True
-    return False
+        return row is not None and row['last_checked_block'] is not None and row['last_checked_block'] >= min_block
 
 def set_visited_address_cache(address: str, block_number: int):
-    """Обновляет кэш адреса."""
     with get_connection() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO visited_addresses (address, last_checked_block, checked_at) VALUES (?, ?, ?)",
             (address, block_number, datetime.utcnow())
         )
         conn.commit()
+        logger.debug(f"Кэш посещённых адресов обновлён: {address} (блок {block_number})")
 
 def increment_api_usage(service: str, key_index: int):
-    """Увеличивает счётчик использования API."""
     today = date.today().isoformat()
     with get_connection() as conn:
         conn.execute(
@@ -159,7 +152,6 @@ def increment_api_usage(service: str, key_index: int):
         conn.commit()
 
 def get_api_usage_today(service: str, key_index: int) -> int:
-    """Возвращает число запросов за сегодня для указанного API и ключа."""
     today = date.today().isoformat()
     with get_connection() as conn:
         row = conn.execute(
@@ -169,7 +161,6 @@ def get_api_usage_today(service: str, key_index: int) -> int:
         return row['count'] if row else 0
 
 def get_all_api_usage() -> dict:
-    """Возвращает словарь с использованными лимитами для /dashboard."""
     today = date.today().isoformat()
     usage = {}
     with get_connection() as conn:
@@ -183,7 +174,6 @@ def get_all_api_usage() -> dict:
     return usage
 
 def update_task_progress(request_id: int, processed: int):
-    """Обновляет прогресс задачи."""
     with get_connection() as conn:
         conn.execute(
             "UPDATE task_progress SET processed_addresses=? WHERE request_id=?",
