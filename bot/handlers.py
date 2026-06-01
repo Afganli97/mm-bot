@@ -16,7 +16,7 @@ from bot.database import get_all_api_usage, get_user_setting, set_user_setting, 
 from bot.graph_traversal import GraphTraversal
 from bot.token_filter import update_top_tokens
 from bot.api_clients import (
-    EVMExplorerClient, EVMWeb3Client, SolscanClient, CoingeckoClient
+    EVMExplorerClient, EVMWeb3Client, SolscanClient, CoingeckoClient, TokenInfoService
 )
 from bot.networks.ethereum import EthereumNetwork
 from bot.networks.bsc import BscNetwork
@@ -24,7 +24,7 @@ from bot.networks.solana import SolanaNetwork
 
 logger = logging.getLogger(__name__)
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
-MIN_USD_VALUE = 0.10   # минимальная стоимость токена для отображения (кроме нативного)
+MIN_USD_VALUE = 0.10
 
 def _get_global_session(context: ContextTypes.DEFAULT_TYPE):
     session = context.application.bot_data.get('session')
@@ -40,11 +40,22 @@ def web3_is_address(addr: str) -> bool:
 def get_network_for_address(address: str, session):
     networks = []
     if web3_is_address(address):
+        # Ethereum
         eth_conf = NETWORKS["ethereum"]
         eth_explorer = EVMExplorerClient(eth_conf["chain_id"], eth_conf["weth"])
-        networks.append(EthereumNetwork(eth_conf, session, eth_explorer))
+        eth_web3 = EVMWeb3Client(
+            eth_conf["rpc_url"], eth_conf["chain_id"], eth_conf["weth"],
+            router_address=eth_conf.get("dex_routers", [""])[0],
+            stable_address=eth_conf.get("stablecoins", [""])[0]
+        )
+        networks.append(EthereumNetwork(eth_conf, session, eth_explorer, eth_web3))
+        # BSC
         bsc_conf = NETWORKS["bsc"]
-        bsc_web3 = EVMWeb3Client(bsc_conf["rpc_url"], bsc_conf["chain_id"], bsc_conf["weth"])
+        bsc_web3 = EVMWeb3Client(
+            bsc_conf["rpc_url"], bsc_conf["chain_id"], bsc_conf["weth"],
+            router_address=bsc_conf.get("dex_routers", [""])[0],
+            stable_address=bsc_conf.get("stablecoins", [""])[0]
+        )
         networks.append(BscNetwork(bsc_conf, session, bsc_web3))
     try:
         from solders.pubkey import Pubkey
@@ -142,21 +153,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"⏳ Запущен анализ истории покупок ({net_name})...")
             await run_history(query, context, network)
 
-async def get_token_price(session, token_address, network_name):
-    """Получает цену токена в USD через CoinGecko. Адрес должен быть в нижнем регистре."""
-    platform = {"ethereum":"ethereum", "bsc":"binance-smart-chain", "solana":"solana"}.get(network_name)
-    if not platform:
-        return 0.0
+async def get_token_price(session, token_address, network_name, network, weth_price_usd: float = 0.0) -> Optional[float]:
     addr = token_address.lower()
-    url = f"https://api.coingecko.com/api/v3/simple/token_price/{platform}?contract_addresses={addr}&vs_currencies=usd"
-    try:
-        async with session.get(url, timeout=10) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get(addr, {}).get("usd", 0.0)
-    except Exception:
-        pass
-    return 0.0
+    # CoinGecko
+    platform = {"ethereum":"ethereum", "bsc":"binance-smart-chain", "solana":"solana"}.get(network_name)
+    if platform:
+        try:
+            url = f"https://api.coingecko.com/api/v3/simple/token_price/{platform}?contract_addresses={addr}&vs_currencies=usd"
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    price = data.get(addr, {}).get("usd")
+                    if price is not None:
+                        return float(price)
+        except Exception:
+            pass
+    # RPC-роутер
+    if hasattr(network, 'web3') and isinstance(network.web3, EVMWeb3Client):
+        try:
+            price = await network.web3.get_price_via_router(session, addr, weth_price_usd)
+            if price is not None:
+                return price
+        except Exception:
+            pass
+    return None
 
 async def show_balance(query, context, network):
     address = context.user_data['address']
@@ -166,10 +186,8 @@ async def show_balance(query, context, network):
             native_balance = await network.get_balance(address)
             token_balances = await network.get_token_balances(address)
 
-            # Получаем цену нативного токена
             native_price = 0.0
             try:
-                # CoinGecko ID для BNB – 'binancecoin', для ETH – 'ethereum'
                 coin_id = {"ethereum":"ethereum", "bsc":"binancecoin", "solana":"solana"}.get(network.name.lower())
                 if coin_id:
                     price_url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
@@ -181,16 +199,16 @@ async def show_balance(query, context, network):
                 pass
 
             total_usd = native_balance * native_price
-            native_usd = native_balance * native_price
-
             lines = [f"💰 <b>Баланс сети {network.name}</b>\n"
-                     f"{network.native_symbol}: {native_balance:.6f} (≈ ${native_usd:.2f})"]
+                     f"{network.native_symbol}: {native_balance:.6f} (≈ ${native_balance * native_price:.2f})"]
 
             for tok in token_balances:
-                price = await get_token_price(session, tok['address'], network.name)
+                price = await get_token_price(session, tok['address'], network.name, network, native_price)
+                if price is None:
+                    continue
                 usd_val = tok['balance'] * price
                 if usd_val < MIN_USD_VALUE:
-                    continue   # пропускаем мусор
+                    continue
                 total_usd += usd_val
                 link = f"https://dexscreener.com/{network.name.lower()}/{tok['address']}"
                 lines.append(f"• <a href='{link}'>{tok['symbol']}</a>: {tok['balance']:.4f} (≈ ${usd_val:.2f})")
