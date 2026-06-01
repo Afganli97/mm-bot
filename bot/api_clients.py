@@ -122,7 +122,7 @@ class EVMExplorerClient:
         self.delay = delay
         self.rotator = etherscan_rotator
 
-    async def get_block_by_timestamp(self, session: aiohttp.ClientSession, timestamp: int) -> int:
+    async def get_block_by_timestamp(self, session, timestamp):
         params = {"module": "block", "action": "getblocknobytime", "timestamp": timestamp, "closest": "before"}
         data = await self.rotator.make_request(session, self.BASE_URL, params, delay=self.delay, chain_id=self.chain_id)
         return int(data["result"])
@@ -178,11 +178,13 @@ class EVMExplorerClient:
         return int(data["result"]) / 10**18
 
 class EVMWeb3Client:
-    """Клиент для EVM‑сетей через JSON‑RPC (Alchemy/Infura). Используется для BSC."""
+    """Клиент для EVM‑сетей через JSON‑RPC (Alchemy/Infura). Используется для BSC и других."""
     def __init__(self, rpc_url: str, chain_id: int, weth_address: str):
         self.rpc_url = rpc_url
         self.chain_id = chain_id
         self.weth_address = weth_address.lower()
+        # Определяем, используется ли Alchemy (для специальных методов)
+        self.is_alchemy = "alchemy" in rpc_url
 
     async def _rpc_call(self, session, method, params):
         payload = {"jsonrpc":"2.0","method":method,"params":params,"id":1}
@@ -192,34 +194,97 @@ class EVMWeb3Client:
                 raise Exception(data["error"])
             return data["result"]
 
+    async def get_current_block(self, session) -> int:
+        result = await self._rpc_call(session, "eth_blockNumber", [])
+        return int(result, 16)
+
+    async def get_block_by_timestamp_approx(self, session, target_ts: int) -> int:
+        """
+        Приблизительно вычисляет номер блока, соответствующий временной метке.
+        Для BSC среднее время блока ~3 сек.
+        """
+        current_block = await self.get_current_block(session)
+        # Текущее время (UTC) можно получить из RPC, но упростим – используем system time
+        import time
+        now_ts = int(time.time())
+        avg_block_time = 3  # секунды
+        block_diff = (now_ts - target_ts) // avg_block_time
+        return max(0, current_block - block_diff)
+
     async def get_balance(self, session, address: str) -> float:
         result = await self._rpc_call(session, "eth_getBalance", [address, "latest"])
         return int(result, 16) / 10**18
 
     async def get_token_transfers(self, session, address, direction="to", from_block=0, to_block=99999999) -> List[Dict]:
-        transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-        if direction == "to":
-            topic2 = "0x000000000000000000000000" + address[2:].lower()
-            params = [{"fromBlock": hex(from_block), "toBlock": hex(to_block), "topics": [transfer_topic, None, topic2]}]
-        else:
-            topic1 = "0x000000000000000000000000" + address[2:].lower()
-            params = [{"fromBlock": hex(from_block), "toBlock": hex(to_block), "topics": [transfer_topic, topic1, None]}]
-        logs = await self._rpc_call(session, "eth_getLogs", params)
+        """
+        Получает токен‑трансферы через eth_getLogs с разбивкой на чанки по 10 блоков.
+        """
         transfers = []
-        for log in logs:
-            token = log["address"]
-            if token.lower() == self.weth_address:
-                continue
-            value = int(log["data"][2:], 16)
-            block_num = int(log["blockNumber"], 16)
-            tx_hash = log["transactionHash"]
-            from_addr = "0x" + log["topics"][1][-40:]
-            to_addr = "0x" + log["topics"][2][-40:]
-            transfers.append({
-                "token_address": token, "tx_hash": tx_hash, "block_number": block_num,
-                "from": from_addr, "to": to_addr, "value": value
-            })
+        transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+        # Разбиваем диапазон на чанки по 10 блоков (ограничение бесплатного Alchemy)
+        chunk_size = 10
+        current = from_block
+        while current <= to_block:
+            end = min(current + chunk_size - 1, to_block)
+            if direction == "to":
+                topic2 = "0x000000000000000000000000" + address[2:].lower()
+                params = [{"fromBlock": hex(current), "toBlock": hex(end),
+                           "topics": [transfer_topic, None, topic2]}]
+            else:
+                topic1 = "0x000000000000000000000000" + address[2:].lower()
+                params = [{"fromBlock": hex(current), "toBlock": hex(end),
+                           "topics": [transfer_topic, topic1, None]}]
+            try:
+                logs = await self._rpc_call(session, "eth_getLogs", params)
+                for log in logs:
+                    token = log["address"]
+                    if token.lower() == self.weth_address:
+                        continue
+                    value = int(log["data"][2:], 16)
+                    block_num = int(log["blockNumber"], 16)
+                    tx_hash = log["transactionHash"]
+                    from_addr = "0x" + log["topics"][1][-40:]
+                    to_addr = "0x" + log["topics"][2][-40:]
+                    transfers.append({
+                        "token_address": token, "tx_hash": tx_hash, "block_number": block_num,
+                        "from": from_addr, "to": to_addr, "value": value
+                    })
+            except Exception as e:
+                logger.error(f"Ошибка получения логов (блоки {current}-{end}): {e}")
+            current = end + 1
         return transfers
+
+    async def get_token_balances_alchemy(self, session, address: str) -> List[Dict]:
+        """Использует Alchemy API для получения балансов токенов (без ограничений по блокам)."""
+        url = self.rpc_url
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "alchemy_getTokenBalances",
+            "params": [address],
+            "id": 1
+        }
+        async with session.post(url, json=payload, timeout=10) as resp:
+            data = await resp.json()
+            if "error" in data:
+                raise Exception(data["error"])
+            result = data.get("result", {})
+            token_balances = result.get("tokenBalances", [])
+            balances = []
+            for item in token_balances:
+                token_address = item["contractAddress"]
+                balance_hex = item["tokenBalance"]
+                if balance_hex == "0x0000000000000000000000000000000000000000000000000000000000000000":
+                    continue
+                balance = int(balance_hex, 16)
+                # Символ и decimals можно получить отдельно, пока оставим без символа
+                balances.append({
+                    "address": token_address,
+                    "symbol": "?",
+                    "balance": balance,  # сырое значение, без decimals
+                    "decimals": 0
+                })
+            return balances
 
 class TokenInfoService:
     @staticmethod
