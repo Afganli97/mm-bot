@@ -1,6 +1,6 @@
 """
 Инициализация и работа с SQLite.
-Хранит кэш адресов, результаты задач, счётчики API, кэш топ-токенов.
+Хранит кэш адресов, результаты задач, счётчики API, кэш топ-токенов, настройки пользователей.
 """
 import sqlite3
 import logging
@@ -72,6 +72,14 @@ def init_db():
                 max_addresses INTEGER,
                 status TEXT DEFAULT 'running',
                 FOREIGN KEY (request_id) REFERENCES requests(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER NOT NULL,
+                setting TEXT NOT NULL,
+                value TEXT,
+                PRIMARY KEY (user_id, setting)
             )
         """)
         conn.commit()
@@ -180,3 +188,28 @@ def update_task_progress(request_id: int, processed: int):
             (processed, request_id)
         )
         conn.commit()
+
+def get_user_setting(user_id: int, setting: str, default: str = None) -> str:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT value FROM user_settings WHERE user_id=? AND setting=?",
+            (user_id, setting)
+        ).fetchone()
+        return row['value'] if row else default
+
+def set_user_setting(user_id: int, setting: str, value: str):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO user_settings (user_id, setting, value) VALUES (?, ?, ?)",
+            (user_id, setting, value)
+        )
+        conn.commit()
+        logger.debug(f"Пользователь {user_id}: {setting} = {value}")
+
+def get_user_settings_dict(user_id: int) -> dict:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT setting, value FROM user_settings WHERE user_id=?",
+            (user_id,)
+        ).fetchall()
+        return {r['setting']: r['value'] for r in rows}
