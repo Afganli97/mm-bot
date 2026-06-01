@@ -64,7 +64,7 @@ class APIKeyRotator:
                 params = params or {}
                 params["apikey"] = key
                 if self.service == "bscscan":
-                    params["chainid"] = 56  # BSC
+                    params["chainid"] = 56
                 else:
                     params["chainid"] = 1
 
@@ -79,7 +79,7 @@ class APIKeyRotator:
                             increment_api_usage(self.service, idx)
                             return data
                         elif resp.status == 429:
-                            logger.warning("429 от Solscan, пробуем следующий ключ")
+                            logger.warning("429 от Solscan")
                             continue
                         else:
                             raise Exception(f"Solscan HTTP {resp.status}")
@@ -89,7 +89,7 @@ class APIKeyRotator:
                             data = await resp.json()
                             logger.debug(f"Ответ {self.service}: {data}")
                             if self.service in ("etherscan", "bscscan"):
-                                if data.get("message") == "No transactions found" or data.get("message") == "No records found":
+                                if data.get("message") in ("No transactions found", "No records found"):
                                     increment_api_usage(self.service, idx)
                                     return {"status": "1", "message": "OK", "result": []}
                                 if data.get("status") == "1" or data.get("message") == "OK":
@@ -105,7 +105,7 @@ class APIKeyRotator:
                                 increment_api_usage(self.service, idx)
                                 return data
                         elif resp.status == 429:
-                            logger.warning(f"429 от {self.service}, пробуем следующий ключ")
+                            logger.warning(f"429 от {self.service}")
                             await asyncio.sleep(1)
                             continue
                         else:
@@ -117,9 +117,8 @@ class APIKeyRotator:
                 raise
         raise Exception("Все попытки запроса исчерпаны")
 
-# Ротаторы для сервисов
 etherscan_rotator = APIKeyRotator(ETHERSCAN_API_KEYS, "etherscan", ETHERSCAN_DAILY_LIMIT)
-bscscan_rotator = APIKeyRotator(ETHERSCAN_API_KEYS, "bscscan", BSCSCAN_DAILY_LIMIT)  # используем те же ключи
+bscscan_rotator = APIKeyRotator(ETHERSCAN_API_KEYS, "bscscan", BSCSCAN_DAILY_LIMIT) if ETHERSCAN_API_KEYS else None
 solscan_rotator = APIKeyRotator([SOLSCAN_API_KEY], "solscan", SOLSCAN_DAILY_LIMIT) if SOLSCAN_API_KEY else None
 
 class EVMExplorerClient:
@@ -249,3 +248,60 @@ class SolscanClient:
         url = f"{self.BASE_URL}/account/transactions?address={address}&limit={limit}"
         data = await self.rotator.make_request(session, url, headers={}, delay=0.3)
         return data.get("data", [])
+
+class CoingeckoClient:
+    BASE_URL = "https://api.coingecko.com/api/v3"
+
+    @staticmethod
+    async def get_top_100(session: aiohttp.ClientSession, network_name: str = "ethereum") -> List[Dict]:
+        from bot.database import get_connection
+        from datetime import timedelta
+        import json
+
+        platform_map = {
+            "ethereum": "ethereum",
+            "bsc": "binance-smart-chain",
+            "solana": "solana"
+        }
+        platform = platform_map.get(network_name)
+        if not platform:
+            logger.warning(f"CoinGecko не поддерживает сеть {network_name}")
+            return []
+
+        cache_network = network_name
+
+        with get_connection() as conn:
+            row = conn.execute("SELECT tokens_json, updated_at FROM top_tokens_cache WHERE network=?",
+                               (cache_network,)).fetchone()
+            if row:
+                updated = datetime.fromisoformat(row['updated_at'])
+                if (datetime.utcnow() - updated) < timedelta(hours=1):
+                    return json.loads(row['tokens_json'])
+
+        url = f"{CoingeckoClient.BASE_URL}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=false"
+        if network_name != "ethereum":
+            # Добавляем категорию для BSC, для Solana позже
+            if network_name == "bsc":
+                url += "&category=binance-smart-chain"
+
+        async with session.get(url, timeout=30) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                tokens = []
+                for coin in data:
+                    addr = coin.get("platforms", {}).get(platform, "")
+                    if addr:
+                        tokens.append({
+                            "id": coin["id"],
+                            "symbol": coin["symbol"].upper(),
+                            "address": addr.lower()
+                        })
+                with get_connection() as conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO top_tokens_cache (network, updated_at, tokens_json) VALUES (?, ?, ?)",
+                        (cache_network, datetime.utcnow().isoformat(), json.dumps(tokens))
+                    )
+                    conn.commit()
+                return tokens
+            else:
+                raise Exception("CoinGecko API error")
