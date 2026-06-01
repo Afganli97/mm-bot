@@ -51,18 +51,23 @@ def web3_is_address(addr: str) -> bool:
     return Web3.is_address(addr)
 
 def get_network_for_address(address: str, session):
+    from bot.config import NETWORKS
+    from bot.networks.ethereum import EthereumNetwork
+    from bot.networks.bsc import BscNetwork
+    from bot.networks.solana import SolanaNetwork
+    from bot.api_clients import EVMExplorerClient
+
     networks = []
-    # Ethereum
     if web3_is_address(address):
+        # Ethereum
         eth_conf = NETWORKS["ethereum"]
-        explorer = EVMExplorerClient(eth_conf["explorer_api_url"], etherscan_rotator, eth_conf["chain_id"], eth_conf["weth"])
-        networks.append(EthereumNetwork(eth_conf, session, explorer))
-    # BSC
-    if web3_is_address(address):
+        eth_explorer = EVMExplorerClient(eth_conf["chain_id"], eth_conf["weth"])
+        networks.append(EthereumNetwork(eth_conf, session, eth_explorer))
+        # BSC
         bsc_conf = NETWORKS["bsc"]
-        explorer = EVMExplorerClient(bsc_conf["explorer_api_url"], bscscan_rotator, bsc_conf["chain_id"], bsc_conf["weth"])
-        networks.append(BscNetwork(bsc_conf, session, explorer))
-    # Solana
+        bsc_explorer = EVMExplorerClient(bsc_conf["chain_id"], bsc_conf["weth"])
+        networks.append(BscNetwork(bsc_conf, session, bsc_explorer))
+
     try:
         from solders.pubkey import Pubkey
         Pubkey.from_string(address)
@@ -70,6 +75,7 @@ def get_network_for_address(address: str, session):
         networks.append(SolanaNetwork(sol_conf, session))
     except Exception:
         pass
+
     return networks
 
 def _check_access(update: Update) -> bool:
