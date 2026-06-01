@@ -17,7 +17,7 @@ from bot.database import get_all_api_usage, get_user_setting, set_user_setting, 
 from bot.graph_traversal import GraphTraversal
 from bot.token_filter import update_top_tokens
 from bot.api_clients import (
-    etherscan_rotator, bscscan_rotator, EVMExplorerClient, SolscanClient, CoingeckoClient
+    etherscan_rotator, EVMExplorerClient, SolscanClient, CoingeckoClient
 )
 from bot.networks.ethereum import EthereumNetwork
 from bot.networks.bsc import BscNetwork
