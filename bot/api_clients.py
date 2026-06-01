@@ -1,5 +1,5 @@
 """
-Асинхронные клиенты для Etherscan, BscScan, Solscan, RPC.
+Асинхронные клиенты для Etherscan (единый V2 для всех EVM), Solscan, RPC.
 Управляют лимитами, ротацией ключей, кэшированием.
 """
 import asyncio
@@ -17,7 +17,6 @@ from bot.database import increment_api_usage, get_api_usage_today
 logger = logging.getLogger(__name__)
 
 ETHERSCAN_DAILY_LIMIT = 100_000
-BSCSCAN_DAILY_LIMIT = 100_000
 SOLSCAN_DAILY_LIMIT = 100_000
 
 class APIKeyRotator:
@@ -49,8 +48,8 @@ class APIKeyRotator:
         return None
 
     async def make_request(self, session: aiohttp.ClientSession, url: str, params: dict = None,
-                           headers: dict = None, delay: float = 0.4) -> dict:
-        if self.service in ("etherscan", "bscscan"):
+                           headers: dict = None, delay: float = 0.4, chain_id: int = None) -> dict:
+        if self.service == "etherscan":
             await asyncio.sleep(delay)
 
         for attempt in range(len(self.keys)):
@@ -60,12 +59,11 @@ class APIKeyRotator:
                 raise Exception(f"Дневной лимит API {self.service} исчерпан")
             key, idx = key_info
 
-            if self.service in ("etherscan", "bscscan"):
+            if self.service == "etherscan":
                 params = params or {}
                 params["apikey"] = key
-                if self.service == "etherscan":
-                    params["chainid"] = 1
-    # Для bscscan chainid не требуется (V1 API)
+                if chain_id is not None:
+                    params["chainid"] = chain_id
 
             logger.debug(f"Запрос к {self.service} (ключ {idx}): URL={url}, params={params}")
             try:
@@ -87,7 +85,7 @@ class APIKeyRotator:
                         if resp.status == 200:
                             data = await resp.json()
                             logger.debug(f"Ответ {self.service}: {data}")
-                            if self.service in ("etherscan", "bscscan"):
+                            if self.service == "etherscan":
                                 if data.get("message") in ("No transactions found", "No records found"):
                                     increment_api_usage(self.service, idx)
                                     return {"status": "1", "message": "OK", "result": []}
@@ -95,11 +93,11 @@ class APIKeyRotator:
                                     increment_api_usage(self.service, idx)
                                     return data
                                 elif data.get("message") == "NOTOK" and "limit" in data.get("result", "").lower():
-                                    logger.warning(f"{self.service} ключ {idx} исчерпал лимит")
+                                    logger.warning(f"Etherscan ключ {idx} исчерпал лимит")
                                     continue
                                 else:
-                                    logger.error(f"{self.service} ошибка: {data}")
-                                    raise Exception(f"{self.service}: {data.get('result', 'Неизвестная ошибка')}")
+                                    logger.error(f"Etherscan ошибка: {data}")
+                                    raise Exception(f"Etherscan: {data.get('result', 'Неизвестная ошибка')}")
                             else:
                                 increment_api_usage(self.service, idx)
                                 return data
@@ -116,22 +114,24 @@ class APIKeyRotator:
                 raise
         raise Exception("Все попытки запроса исчерпаны")
 
+# Единый ротатор для всех EVM сетей
 etherscan_rotator = APIKeyRotator(ETHERSCAN_API_KEYS, "etherscan", ETHERSCAN_DAILY_LIMIT)
-bscscan_rotator = APIKeyRotator(ETHERSCAN_API_KEYS, "bscscan", BSCSCAN_DAILY_LIMIT) if ETHERSCAN_API_KEYS else None
+# Ротатор для Solscan
 solscan_rotator = APIKeyRotator([SOLSCAN_API_KEY], "solscan", SOLSCAN_DAILY_LIMIT) if SOLSCAN_API_KEY else None
 
 class EVMExplorerClient:
-    """Общий клиент для Etherscan-подобных API (Ethereum, BSC)."""
-    def __init__(self, base_url: str, rotator: APIKeyRotator, chain_id: int, weth_address: str, delay: float = 0.4):
-        self.base_url = base_url
-        self.rotator = rotator
+    """Клиент для Etherscan V2 API, охватывает все EVM сети (Ethereum, BSC, Polygon, Base и т.д.)."""
+    BASE_URL = "https://api.etherscan.io/v2/api"
+
+    def __init__(self, chain_id: int, weth_address: str, delay: float = 0.4):
         self.chain_id = chain_id
         self.weth_address = weth_address.lower()
         self.delay = delay
+        self.rotator = etherscan_rotator
 
     async def get_block_by_timestamp(self, session: aiohttp.ClientSession, timestamp: int) -> int:
         params = {"module": "block", "action": "getblocknobytime", "timestamp": timestamp, "closest": "before"}
-        data = await self.rotator.make_request(session, self.base_url, params, delay=self.delay)
+        data = await self.rotator.make_request(session, self.BASE_URL, params, delay=self.delay, chain_id=self.chain_id)
         return int(data["result"])
 
     async def get_normal_transactions(self, session: aiohttp.ClientSession, address: str,
@@ -141,7 +141,7 @@ class EVMExplorerClient:
         while True:
             params = {"module": "account", "action": "txlist", "address": address,
                       "startblock": start_block, "endblock": end_block, "page": page, "offset": 1000, "sort": "asc"}
-            data = await self.rotator.make_request(session, self.base_url, params, delay=self.delay)
+            data = await self.rotator.make_request(session, self.BASE_URL, params, delay=self.delay, chain_id=self.chain_id)
             txs = data.get("result", [])
             if not txs:
                 break
@@ -159,7 +159,7 @@ class EVMExplorerClient:
         while True:
             params = {"module": "account", "action": "txlistinternal", "address": address,
                       "startblock": start_block, "endblock": end_block, "page": page, "offset": 1000, "sort": "asc"}
-            data = await self.rotator.make_request(session, self.base_url, params, delay=self.delay)
+            data = await self.rotator.make_request(session, self.BASE_URL, params, delay=self.delay, chain_id=self.chain_id)
             txs = data.get("result", [])
             if not txs:
                 break
@@ -180,7 +180,7 @@ class EVMExplorerClient:
                       "startblock": start_block, "endblock": end_block, "page": page, "offset": 1000, "sort": "asc"}
             if contract_address:
                 params["contractaddress"] = contract_address
-            data = await self.rotator.make_request(session, self.base_url, params, delay=self.delay)
+            data = await self.rotator.make_request(session, self.BASE_URL, params, delay=self.delay, chain_id=self.chain_id)
             txs = data.get("result", [])
             if not txs:
                 break
@@ -194,7 +194,7 @@ class EVMExplorerClient:
 
     async def get_account_balance(self, session: aiohttp.ClientSession, address: str) -> float:
         params = {"module": "account", "action": "balance", "address": address, "tag": "latest"}
-        data = await self.rotator.make_request(session, self.base_url, params, delay=self.delay)
+        data = await self.rotator.make_request(session, self.BASE_URL, params, delay=self.delay, chain_id=self.chain_id)
         return int(data["result"]) / 10**18
 
 class TokenInfoService:
@@ -279,7 +279,6 @@ class CoingeckoClient:
 
         url = f"{CoingeckoClient.BASE_URL}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=false"
         if network_name != "ethereum":
-            # Добавляем категорию для BSC, для Solana позже
             if network_name == "bsc":
                 url += "&category=binance-smart-chain"
 
