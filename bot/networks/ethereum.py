@@ -4,7 +4,7 @@
 import logging
 import time
 from typing import List, Dict, Set, Optional
-from .base import BaseNetwork
+from ._base import BaseNetwork
 from bot.api_clients import EVMExplorerClient, TokenInfoService
 from bot.database import get_visited_address_cache, set_visited_address_cache
 
