@@ -3,7 +3,7 @@
 """
 import logging
 from typing import List, Dict
-from .base import BaseNetwork
+from ._base import BaseNetwork
 from solders.pubkey import Pubkey
 from bot.api_clients import SolscanClient
 
