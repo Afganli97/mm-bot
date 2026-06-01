@@ -23,10 +23,10 @@ class EthereumNetwork(BaseNetwork):
     async def get_token_balances(self, address: str) -> List[Dict]:
         txs = await self.explorer.get_token_transfers(self.session, address)
         balances = {}
-        weth = self.config["weth"].lower() if self.config["weth"] else None
+        weth = self.config["weth"].lower()
         for tx in txs:
             contract = tx['contractAddress'].lower()
-            if weth and contract == weth:
+            if contract == weth:
                 continue
             if tx['to'].lower() == address.lower():
                 balances[contract] = balances.get(contract, 0) + int(tx['value'])
