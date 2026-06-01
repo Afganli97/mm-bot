@@ -26,6 +26,30 @@ from bot.networks.solana import SolanaNetwork
 logger = logging.getLogger(__name__)
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 
+# --- Вспомогательные функции ---
+
+def _get_global_session(context: ContextTypes.DEFAULT_TYPE):
+    """Возвращает глобальную aiohttp сессию из bot_data, либо создаёт новую."""
+    session = context.application.bot_data.get('session')
+    if session is None:
+        logger.warning("Глобальная сессия не найдена, создаю временную")
+        from aiohttp import ClientSession
+        return ClientSession()
+    return session
+
+async def _get_session_for_network(context: ContextTypes.DEFAULT_TYPE):
+    """Возвращает сессию и гарантирует, что она активна."""
+    session = context.application.bot_data.get('session')
+    if session is None or session.closed:
+        from aiohttp import ClientSession
+        session = ClientSession()
+        context.application.bot_data['session'] = session
+    return session
+
+def web3_is_address(addr: str) -> bool:
+    from web3 import Web3
+    return Web3.is_address(addr)
+
 def get_network_for_address(address: str, session):
     networks = []
     # Ethereum
@@ -48,16 +72,14 @@ def get_network_for_address(address: str, session):
         pass
     return networks
 
-def web3_is_address(addr: str) -> bool:
-    from web3 import Web3
-    return Web3.is_address(addr)
-
 def _check_access(update: Update) -> bool:
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS:
         logger.info(f"Попытка доступа от непривилегированного пользователя {user_id}")
         return False
     return True
+
+# --- Обработчики команд ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update):
@@ -90,15 +112,24 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{service}: {count}\n"
     await update.message.reply_text(msg, parse_mode="HTML")
 
+# --- Основной обработчик сообщений (адрес кошелька) ---
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update):
         return
+    # Если ожидается ввод значения для настройки – передаём управление
+    if context.user_data.get('awaiting_setting'):
+        await setting_value_input(update, context)
+        return
+
     text = update.message.text.strip()
-    networks = get_network_for_address(text, context.application.session)
+    session = _get_global_session(context)
+    networks = get_network_for_address(text, session)
+
     if not networks:
         await update.message.reply_text("❌ Адрес не распознан ни в одной поддерживаемой сети.")
         return
-    # Сохраняем в контексте пользователя
+
     context.user_data['networks'] = networks
     context.user_data['address'] = text
 
@@ -110,20 +141,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await show_mode_menu(update, context, networks[0])
 
-async def show_mode_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, network):
+async def show_mode_menu(update_or_query, context, network):
     keyboard = [
         [InlineKeyboardButton("💰 Баланс", callback_data=f"mode_balance_{network.name}")],
         [InlineKeyboardButton("📜 История покупок", callback_data=f"mode_history_{network.name}")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
+    if hasattr(update_or_query, 'callback_query') and update_or_query.callback_query:
+        await update_or_query.callback_query.edit_message_text(
             f"Выберите действие для сети {network.name}:", reply_markup=reply_markup
         )
     else:
-        await update.message.reply_text(
+        await update_or_query.message.reply_text(
             f"Выберите действие для сети {network.name}:", reply_markup=reply_markup
         )
+
+# --- Обработчик нажатий на кнопки (выбор сети и режима) ---
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -134,7 +167,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         net_name = data[4:]
         networks = context.user_data.get('networks', [])
         if net_name == "all":
-            context.user_data['selected_network'] = None  # все сети
+            context.user_data['selected_network'] = None
             await query.edit_message_text("⏳ Запущен анализ истории по всем сетям...")
             await run_all_history(query, context, networks)
         else:
@@ -148,7 +181,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("mode_"):
         parts = data.split("_")
         action = parts[1]
-        net_name = "_".join(parts[2:])  # на случай имени сети из нескольких слов (нет)
+        net_name = "_".join(parts[2:])
         network = next((n for n in context.user_data.get('networks', []) if n.name == net_name), None)
         if not network:
             await query.edit_message_text("Сеть не найдена.")
@@ -160,9 +193,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"⏳ Запущен анализ истории покупок ({net_name})...")
             await run_history(query, context, network)
 
+# --- Функции отображения баланса и истории ---
+
 async def get_token_price(session, token_address, network_name):
-    """Возвращает цену токена в USD через CoinGecko (по адресу контракта)."""
-    # Используем API coin/contract/{address}
     platform = {"ethereum":"ethereum","bsc":"binance-smart-chain","solana":"solana"}.get(network_name)
     if not platform:
         return 0.0
@@ -184,7 +217,6 @@ async def show_balance(query, context, network):
             native_balance = await network.get_balance(address)
             token_balances = await network.get_token_balances(address)
 
-            # Получаем цену нативного токена
             native_price = 0.0
             try:
                 price_url = f"https://api.coingecko.com/api/v3/simple/price?ids={network.native_symbol.lower()}&vs_currencies=usd"
@@ -218,7 +250,6 @@ async def run_history(query, context, network):
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
-            # Используем настройки пользователя
             user_id = query.from_user.id
             max_tokens = int(get_user_setting(user_id, "max_tokens", str(DEFAULT_MAX_FOUND_TOKENS)))
             lookback_days = int(get_user_setting(user_id, "lookback_days", str(DEFAULT_LOOKBACK_DAYS)))
@@ -232,7 +263,6 @@ async def run_history(query, context, network):
                 await query.edit_message_text("✅ Анализ завершён. Токены не найдены.")
                 return
 
-            # Уникальные токены
             unique = {}
             for item in found:
                 addr = item['token']
@@ -266,14 +296,25 @@ async def run_all_history(query, context, networks):
         try:
             from aiohttp import ClientSession
             async with ClientSession() as session:
-                traversal = GraphTraversal(session, address, net, max_tokens=50)  # ограничим
+                traversal = GraphTraversal(session, address, net, max_tokens=50)
                 found = await traversal.run()
                 all_found.extend(found)
         except Exception:
             pass
-    # Формируем отчёт аналогично
-    # ... (сокращённо)
-    await query.edit_message_text("История по всем сетям собрана (заглушка).")
+    if not all_found:
+        await query.edit_message_text("Токены не найдены ни в одной сети.")
+        return
+    unique = {}
+    for item in all_found:
+        addr = item['token']
+        if addr not in unique:
+            unique[addr] = item
+    lines = []
+    for addr, data in unique.items():
+        lines.append(f"• {data['symbol']} (<code>{addr}</code>)")
+    report = f"✅ <b>История по всем сетям</b>\nНайдено токенов: {len(lines)}\n" + "\n".join(lines)
+    await _send_long_message(context.bot, query.message.chat_id, report, parse_mode="HTML")
+    await query.edit_message_text("✅ Готово.")
 
 async def _send_long_message(bot, chat_id, text, parse_mode="HTML"):
     if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
@@ -290,7 +331,8 @@ async def _send_long_message(bot, chat_id, text, parse_mode="HTML"):
         if chunk:
             await bot.send_message(chat_id, chunk.strip(), parse_mode=parse_mode, disable_web_page_preview=True)
 
-# Команда /settings
+# --- Настройки ---
+
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update):
         return
@@ -313,7 +355,6 @@ async def settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     if data == "reset_settings":
-        # Удаляем все настройки пользователя
         from bot.database import get_connection
         with get_connection() as conn:
             conn.execute("DELETE FROM user_settings WHERE user_id=?", (user_id,))
@@ -321,7 +362,6 @@ async def settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Настройки сброшены.")
         return
 
-    # Запрашиваем новое значение
     setting_map = {
         "set_max_depth": ("max_depth", "Введите новую глубину обхода (число):"),
         "set_lookback_days": ("lookback_days", "Введите период анализа в днях (число):"),
@@ -333,26 +373,28 @@ async def settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['awaiting_setting'] = key
         await query.edit_message_text(prompt)
 
-# Обработчик текстовых сообщений для ввода настроек
 async def setting_value_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ввода значения настройки."""
     if not _check_access(update):
         return
-    if 'awaiting_setting' not in context.user_data:
-        await handle_message(update, context)
-        return
-    key = context.user_data.pop('awaiting_setting')
+    key = context.user_data.pop('awaiting_setting', None)
+    if not key:
+        # Не ожидался ввод настройки, возможно, это адрес – пробуем обработать как адрес
+        return await handle_message(update, context)
     value = update.message.text.strip()
     user_id = update.effective_user.id
     set_user_setting(user_id, key, value)
     await update.message.reply_text(f"✅ Настройка {key} обновлена: {value}")
 
-# Регистрация обработчиков
+# --- Регистрация обработчиков ---
+
 def register_handlers(app):
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("dashboard", dashboard))
     app.add_handler(CommandHandler("settings", settings))
+    # Основной обработчик для текстовых сообщений (адрес или ввод настройки)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Обработчики кнопок
     app.add_handler(CallbackQueryHandler(button_handler, pattern="^(net_|mode_).*"))
     app.add_handler(CallbackQueryHandler(settings_button, pattern="^(set_|reset_settings).*"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, setting_value_input), group=1)
