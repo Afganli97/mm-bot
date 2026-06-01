@@ -63,10 +63,9 @@ class APIKeyRotator:
             if self.service in ("etherscan", "bscscan"):
                 params = params or {}
                 params["apikey"] = key
-                if self.service == "bscscan":
-                    params["chainid"] = 56
-                else:
+                if self.service == "etherscan":
                     params["chainid"] = 1
+    # Для bscscan chainid не требуется (V1 API)
 
             logger.debug(f"Запрос к {self.service} (ключ {idx}): URL={url}, params={params}")
             try:
