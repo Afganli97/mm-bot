@@ -8,7 +8,7 @@ import aiohttp
 from datetime import datetime, timezone
 
 from bot.config import (
-    ETHERSCAN_API_KEYS, ALCHEMY_URL, INFURA_URL,
+    ETHERSCAN_API_KEYS,
     SOLSCAN_API_KEY, HELIUS_URL
 )
 from bot.database import increment_api_usage, get_api_usage_today
