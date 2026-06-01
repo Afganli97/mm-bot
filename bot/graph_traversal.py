@@ -1,7 +1,5 @@
 """
 Основной алгоритм обхода адресов и поиска покупок.
-Для Ethereum используются данные Etherscan (анализ исходящих транзакций),
-для BSC и других RPC‑сетей – упрощённый подход (все входящие токены считаются покупками).
 """
 import asyncio
 import logging
@@ -34,7 +32,6 @@ class GraphTraversal:
         self.found_tokens = []
         self.unique_token_addresses = set()
         self.token_limit_reached = False
-        # Определяем тип клиента
         self.is_rpc = hasattr(network, 'web3') and isinstance(network.web3, EVMWeb3Client)
 
     async def run(self) -> List[Dict]:
@@ -48,7 +45,11 @@ class GraphTraversal:
                 self.start_block = await self.network.explorer.get_block_by_timestamp(self.session, thirty_days_ago_ts)
                 logger.info(f"Период анализа: блоки {self.start_block} - текущий")
             else:
-                logger.info("RPC‑режим: все входящие токены считаются покупками (без анализа исходящих транзакций)")
+                # Для RPC вычисляем приблизительный блок начала периода
+                thirty_days_ago_ts = int(time.time()) - self.lookback_days * 86400
+                self.start_block = await self.network.web3.get_block_by_timestamp_approx(self.session, thirty_days_ago_ts)
+                self.end_block = await self.network.web3.get_current_block(self.session)
+                logger.info(f"RPC: приблизительный период блоков {self.start_block} - {self.end_block}")
 
             queue = deque([(self.start_address, 0)])
             self.visited.add(self.start_address)
@@ -96,6 +97,7 @@ class GraphTraversal:
                     self.token_limit_reached = True
                     break
 
+                # Для Ethereum обходим получателей
                 if not self.is_rpc:
                     try:
                         transfers, outgoing_blocks = await self._get_outgoing_transfers_and_blocks(addr)
@@ -160,6 +162,5 @@ class GraphTraversal:
         return buys
 
     async def _get_incoming_tokens_rpc(self, address: str) -> List[Dict]:
-        if self.is_rpc:
-            return await self.network.web3.get_token_transfers(self.session, address, direction="to")
-        return []
+        return await self.network.web3.get_token_transfers(self.session, address, direction="to",
+                                                           from_block=self.start_block, to_block=self.end_block)
