@@ -1,5 +1,6 @@
 """
 Фильтрация токенов: исключение стейблкоинов и топ-100.
+Для каждой сети используется свой список.
 """
 import logging
 from typing import List, Dict, Set
@@ -10,28 +11,24 @@ from bot.api_clients import CoingeckoClient
 
 logger = logging.getLogger(__name__)
 
-_top_tokens: Dict[str, str] = {}
-_top_addresses: Set[str] = set()
-_stable_addresses: Set[str] = {addr.lower() for addr in STABLECOINS}
+# Глобальные кэши для каждой сети
+_stable_addresses: Dict[str, Set[str]] = {}
+_top_addresses: Dict[str, Set[str]] = {}
 
-async def update_top_tokens(session: aiohttp.ClientSession):
-    global _top_tokens, _top_addresses
-    try:
-        tokens = await CoingeckoClient.get_top_100(session)
-        _top_tokens = {t['address']: t['symbol'] for t in tokens}
-        _top_addresses = set(_top_tokens.keys())
-        logger.info(f"Обновлён список топ-100: {len(tokens)} токенов")
-        if len(tokens) == 0:
-            logger.warning("CoinGecko вернул 0 токенов топ-100, фильтрация не работает")
-    except Exception as e:
-        logger.exception("Ошибка обновления топ-100")
+async def update_top_tokens(session: aiohttp.ClientSession, network_name: str = "ethereum"):
+    global _top_addresses
+    # Загрузка топ-100 из CoinGecko для конкретной сети
+    # Пока только Ethereum реализован
+    tokens = await CoingeckoClient.get_top_100(session, network_name)
+    _top_addresses[network_name] = {t['address'] for t in tokens}
+    _stable_addresses[network_name] = {s.lower() for s in STABLECOINS}  # берём глобальные стейблкоины
 
-def is_excluded(token_address: str) -> bool:
+def is_excluded(token_address: str, network_name: str = "ethereum") -> bool:
     addr = token_address.lower()
-    excluded = addr in _stable_addresses or addr in _top_addresses
+    excluded = (addr in _stable_addresses.get(network_name, set())) or (addr in _top_addresses.get(network_name, set()))
     if excluded:
-        logger.debug(f"Токен {addr} исключён (стейблкоин или топ-100)")
+        logger.debug(f"Токен {addr} исключён в сети {network_name}")
     return excluded
 
-def get_token_symbol(token_address: str) -> str:
-    return _top_tokens.get(token_address.lower(), "?")
+def get_token_symbol(token_address: str, network_name: str = "ethereum") -> str:
+    return _top_tokens.get(network_name, {}).get(token_address.lower(), "?")
