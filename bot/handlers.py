@@ -147,9 +147,6 @@ async def get_token_price(session, token_address, network_name):
     platform = {"ethereum":"ethereum", "bsc":"binance-smart-chain", "solana":"solana"}.get(network_name)
     if not platform:
         return 0.0
-    # Для Solana имена токенов, а не адреса – пока пропускаем
-    if network_name == "solana":
-        return 0.0
     addr = token_address.lower()
     url = f"https://api.coingecko.com/api/v3/simple/token_price/{platform}?contract_addresses={addr}&vs_currencies=usd"
     try:
