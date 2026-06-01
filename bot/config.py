@@ -66,7 +66,7 @@ NETWORKS = {
         "chain_id": 56,
         "native_symbol": "BNB",
         "weth": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",  # WBNB
-        "explorer_api_url": "https://api.bscscan.com/v2/api",  # BscScan V2
+        "explorer_api_url": "https://api.bscscan.com/api",  # BscScan V1
         "explorer_name": "bscscan",
         "dex_routers": [
             "0x10ED43C718714eb63d5aA57B78B54704E256024E",  # PancakeSwap Router v2
