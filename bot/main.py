@@ -2,7 +2,6 @@
 Главный модуль запуска бота.
 """
 import logging
-import asyncio
 from aiohttp import ClientSession
 from telegram.ext import ApplicationBuilder
 
@@ -20,15 +19,24 @@ logger = logging.getLogger(__name__)
 
 async def post_init(app):
     init_db()
-    async with ClientSession() as session:
-        await update_top_tokens(session)
+    # Инициализируем глобальную сессию для хендлеров (сохраним в bot_data)
+    session = ClientSession()
+    app.bot_data['session'] = session
+    # Обновим фильтры для всех сетей при старте
+    for net_name in ["ethereum", "bsc", "solana"]:
+        await update_top_tokens(session, net_name)
     app.bot_data['etherscan_keys'] = ETHERSCAN_API_KEYS
+
+async def post_shutdown(app):
+    session = app.bot_data.get('session')
+    if session:
+        await session.close()
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("Не задан TELEGRAM_BOT_TOKEN в .env")
         exit(1)
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     register_handlers(application)
     logger.info("Бот запущен")
     application.run_polling()
