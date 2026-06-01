@@ -60,7 +60,7 @@ def init_db():
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS top_tokens_cache (
-                id INTEGER PRIMARY KEY CHECK (id=1),
+                network TEXT PRIMARY KEY,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 tokens_json TEXT NOT NULL
             )
