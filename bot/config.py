@@ -43,7 +43,7 @@ def _evm_rpc_url(chain_id: int) -> str:
     if ALCHEMY_API_KEY:
         subdomains = {
             1: "eth-mainnet",
-            56: "bsc-mainnet",
+            56: "bnb-mainnet",
             137: "polygon-mainnet",
             42161: "arb-mainnet",
             10: "opt-mainnet",
