@@ -2,11 +2,9 @@
 Сеть Ethereum.
 """
 import logging
-import time
 from typing import List, Dict, Set, Optional
 from ._base import BaseNetwork
 from bot.api_clients import EVMExplorerClient, TokenInfoService
-from bot.database import get_visited_address_cache, set_visited_address_cache
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +12,6 @@ class EthereumNetwork(BaseNetwork):
     def __init__(self, network_config: dict, session, explorer_client: EVMExplorerClient):
         super().__init__(network_config, session)
         self.explorer = explorer_client
-        self.rpc_url = self.config["rpc_url"]
 
     async def validate_address(self, address: str) -> bool:
         from web3 import Web3
@@ -38,7 +35,7 @@ class EthereumNetwork(BaseNetwork):
         result = []
         for contract, bal in balances.items():
             if bal > 0:
-                symbol = await TokenInfoService.get_symbol(self.session, contract, self.rpc_url)
+                symbol = await TokenInfoService.get_symbol(self.session, contract, self.config["rpc_url"])
                 result.append({"address": contract, "symbol": symbol, "balance": bal, "decimals": 18})
         return result
 
