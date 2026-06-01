@@ -24,6 +24,7 @@ from bot.networks.solana import SolanaNetwork
 
 logger = logging.getLogger(__name__)
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+MIN_USD_VALUE = 0.10   # минимальная стоимость токена для отображения (кроме нативного)
 
 def _get_global_session(context: ContextTypes.DEFAULT_TYPE):
     session = context.application.bot_data.get('session')
@@ -39,11 +40,9 @@ def web3_is_address(addr: str) -> bool:
 def get_network_for_address(address: str, session):
     networks = []
     if web3_is_address(address):
-        # Ethereum (Etherscan)
         eth_conf = NETWORKS["ethereum"]
         eth_explorer = EVMExplorerClient(eth_conf["chain_id"], eth_conf["weth"])
         networks.append(EthereumNetwork(eth_conf, session, eth_explorer))
-        # BSC (RPC)
         bsc_conf = NETWORKS["bsc"]
         bsc_web3 = EVMWeb3Client(bsc_conf["rpc_url"], bsc_conf["chain_id"], bsc_conf["weth"])
         networks.append(BscNetwork(bsc_conf, session, bsc_web3))
@@ -144,15 +143,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await run_history(query, context, network)
 
 async def get_token_price(session, token_address, network_name):
-    platform = {"ethereum":"ethereum","bsc":"binance-smart-chain","solana":"solana"}.get(network_name)
-    if not platform: return 0.0
-    url = f"https://api.coingecko.com/api/v3/simple/token_price/{platform}?contract_addresses={token_address}&vs_currencies=usd"
+    """Получает цену токена в USD через CoinGecko. Адрес должен быть в нижнем регистре."""
+    platform = {"ethereum":"ethereum", "bsc":"binance-smart-chain", "solana":"solana"}.get(network_name)
+    if not platform:
+        return 0.0
+    # Для Solana имена токенов, а не адреса – пока пропускаем
+    if network_name == "solana":
+        return 0.0
+    addr = token_address.lower()
+    url = f"https://api.coingecko.com/api/v3/simple/token_price/{platform}?contract_addresses={addr}&vs_currencies=usd"
     try:
         async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                return data.get(token_address, {}).get("usd", 0.0)
-    except: pass
+                return data.get(addr, {}).get("usd", 0.0)
+    except Exception:
+        pass
     return 0.0
 
 async def show_balance(query, context, network):
@@ -162,23 +168,36 @@ async def show_balance(query, context, network):
         async with ClientSession() as session:
             native_balance = await network.get_balance(address)
             token_balances = await network.get_token_balances(address)
+
+            # Получаем цену нативного токена
             native_price = 0.0
             try:
-                price_url = f"https://api.coingecko.com/api/v3/simple/price?ids={network.native_symbol.lower()}&vs_currencies=usd"
-                async with session.get(price_url, timeout=10) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        native_price = data.get(network.native_symbol.lower(), {}).get("usd", 0.0)
-            except: pass
+                # CoinGecko ID для BNB – 'binancecoin', для ETH – 'ethereum'
+                coin_id = {"ethereum":"ethereum", "bsc":"binancecoin", "solana":"solana"}.get(network.name.lower())
+                if coin_id:
+                    price_url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+                    async with session.get(price_url, timeout=10) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            native_price = data.get(coin_id, {}).get("usd", 0.0)
+            except Exception:
+                pass
+
             total_usd = native_balance * native_price
+            native_usd = native_balance * native_price
+
             lines = [f"💰 <b>Баланс сети {network.name}</b>\n"
-                     f"{network.native_symbol}: {native_balance:.6f} (≈ ${native_balance * native_price:.2f})"]
+                     f"{network.native_symbol}: {native_balance:.6f} (≈ ${native_usd:.2f})"]
+
             for tok in token_balances:
                 price = await get_token_price(session, tok['address'], network.name)
                 usd_val = tok['balance'] * price
+                if usd_val < MIN_USD_VALUE:
+                    continue   # пропускаем мусор
                 total_usd += usd_val
                 link = f"https://dexscreener.com/{network.name.lower()}/{tok['address']}"
                 lines.append(f"• <a href='{link}'>{tok['symbol']}</a>: {tok['balance']:.4f} (≈ ${usd_val:.2f})")
+
             lines.insert(1, f"<b>Общий баланс: ≈ ${total_usd:.2f}</b>")
             text = "\n".join(lines)
             await _send_long_message(context.bot, query.message.chat_id, text, parse_mode="HTML")
