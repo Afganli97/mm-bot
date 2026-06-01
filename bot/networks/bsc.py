@@ -10,7 +10,6 @@ logger = logging.getLogger(__name__)
 class BscNetwork(EthereumNetwork):
     def __init__(self, network_config: dict, session, explorer_client: EVMExplorerClient):
         super().__init__(network_config, session, explorer_client)
-        self.weth = network_config["weth"].lower()
 
     async def validate_address(self, address: str) -> bool:
         from web3 import Web3
