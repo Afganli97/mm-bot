@@ -24,7 +24,7 @@ from bot.networks.solana import SolanaNetwork
 
 logger = logging.getLogger(__name__)
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
-MIN_USD_VALUE = 0.10
+MIN_USD_VALUE = 0.10   # минимальная стоимость токена для отображения (кроме нативного)
 
 def _get_global_session(context: ContextTypes.DEFAULT_TYPE):
     session = context.application.bot_data.get('session')
@@ -155,7 +155,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_token_price(session, token_address, network_name, network, weth_price_usd: float = 0.0) -> Optional[float]:
     addr = token_address.lower()
-    # CoinGecko
+
+    # 1. Специфичный метод сети (если есть)
+    if hasattr(network, 'get_token_price_usd'):
+        try:
+            price = await network.get_token_price_usd(session, addr)
+            if price is not None:
+                return price
+        except Exception:
+            pass
+
+    # 2. CoinGecko
     platform = {"ethereum":"ethereum", "bsc":"binance-smart-chain", "solana":"solana"}.get(network_name)
     if platform:
         try:
@@ -168,7 +178,8 @@ async def get_token_price(session, token_address, network_name, network, weth_pr
                         return float(price)
         except Exception:
             pass
-    # RPC-роутер
+
+    # 3. RPC-роутер для EVM
     if hasattr(network, 'web3') and isinstance(network.web3, EVMWeb3Client):
         try:
             price = await network.web3.get_price_via_router(session, addr, weth_price_usd)
@@ -176,6 +187,7 @@ async def get_token_price(session, token_address, network_name, network, weth_pr
                 return price
         except Exception:
             pass
+
     return None
 
 async def show_balance(query, context, network):
@@ -186,6 +198,7 @@ async def show_balance(query, context, network):
             native_balance = await network.get_balance(address)
             token_balances = await network.get_token_balances(address)
 
+            # Цена нативного токена
             native_price = 0.0
             try:
                 coin_id = {"ethereum":"ethereum", "bsc":"binancecoin", "solana":"solana"}.get(network.name.lower())
@@ -205,7 +218,7 @@ async def show_balance(query, context, network):
             for tok in token_balances:
                 price = await get_token_price(session, tok['address'], network.name, network, native_price)
                 if price is None:
-                    continue
+                    continue   # Не удалось определить цену – пропускаем (мусор)
                 usd_val = tok['balance'] * price
                 if usd_val < MIN_USD_VALUE:
                     continue
