@@ -4,6 +4,7 @@
 import logging
 import asyncio
 from datetime import datetime, date, timedelta
+from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 
@@ -24,7 +25,7 @@ from bot.networks.solana import SolanaNetwork
 
 logger = logging.getLogger(__name__)
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
-MIN_USD_VALUE = 0.10   # минимальная стоимость токена для отображения (кроме нативного)
+MIN_USD_VALUE = 0.10
 
 def _get_global_session(context: ContextTypes.DEFAULT_TYPE):
     session = context.application.bot_data.get('session')
@@ -218,7 +219,7 @@ async def show_balance(query, context, network):
             for tok in token_balances:
                 price = await get_token_price(session, tok['address'], network.name, network, native_price)
                 if price is None:
-                    continue   # Не удалось определить цену – пропускаем (мусор)
+                    continue
                 usd_val = tok['balance'] * price
                 if usd_val < MIN_USD_VALUE:
                     continue
