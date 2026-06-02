@@ -16,7 +16,6 @@ from bot.config import (
 )
 from bot.database import get_all_api_usage, get_user_setting, set_user_setting, get_user_settings_dict
 from bot.graph_traversal import GraphTraversal
-from bot.token_filter import update_top_tokens
 from bot.api_clients import (
     EVMExplorerClient, BlockscoutClient, EVMWeb3Client, GeckoTerminalClient
 )
@@ -116,7 +115,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
     session = _get_global_session(context)
-    networks = get_network_for_address(text, session, context)   # ← исправлено: передаём context
+    networks = get_network_for_address(text, session, context)
     if not networks:
         await update.message.reply_text("❌ Адрес не распознан ни в одной поддерживаемой сети.")
         return
@@ -199,11 +198,8 @@ async def show_balance(query, context, network):
             native_price = 0.0
             try:
                 coin_id = {"ethereum":"ethereum", "bsc":"binancecoin", "solana":"solana"}.get(network.name.lower())
-                if coin_id and gecko:
-                    # Используем GeckoTerminal для нативного токена (заглушка, не реализовано)
-                    pass
-                if not native_price:
-                    # fallback CoinGecko для нативного (оставим на время)
+                if coin_id:
+                    # Используем CoinGecko для нативного токена (GeckoTerminal не даёт цену нативного токена)
                     price_url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
                     async with session.get(price_url, timeout=10) as resp:
                         if resp.status == 200:
