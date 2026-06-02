@@ -32,16 +32,20 @@ def _get_global_session(context: ContextTypes.DEFAULT_TYPE):
     session = context.application.bot_data.get('session')
     if session is None:
         from aiohttp import ClientSession
-        return ClientSession()
+        session = ClientSession()
+        context.application.bot_data['session'] = session
     return session
 
 def web3_is_address(addr: str) -> bool:
     from web3 import Web3
     return Web3.is_address(addr)
 
-def get_network_for_address(address: str, session):
+def get_network_for_address(address: str, session, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Определяет сети, которым принадлежит адрес, и возвращает список объектов BaseNetwork.
+    """
     networks = []
-    blockscout = session.context.application.bot_data.get('blockscout')
+    blockscout = context.application.bot_data.get('blockscout')
     if web3_is_address(address):
         # Ethereum
         eth_conf = NETWORKS["ethereum"]
@@ -112,7 +116,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
     session = _get_global_session(context)
-    networks = get_network_for_address(text, session)
+    networks = get_network_for_address(text, session, context)   # ← исправлено: передаём context
     if not networks:
         await update.message.reply_text("❌ Адрес не распознан ни в одной поддерживаемой сети.")
         return
