@@ -18,7 +18,7 @@ from bot.database import get_all_api_usage, get_user_setting, set_user_setting, 
 from bot.graph_traversal import GraphTraversal
 from bot.token_filter import update_top_tokens
 from bot.api_clients import (
-    EVMExplorerClient, BlockscoutClient, EVMWeb3Client, SolscanClient, CoingeckoClient, TokenInfoService
+    EVMExplorerClient, BlockscoutClient, EVMWeb3Client, GeckoTerminalClient
 )
 from bot.networks.ethereum import EthereumNetwork
 from bot.networks.bsc import BscNetwork
@@ -177,50 +177,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"⏳ Запущен анализ истории покупок ({net_name})...")
             await run_history(query, context, network)
 
-async def get_token_price(session, token_address, network_name, network, weth_price_usd: float = 0.0) -> Optional[float]:
+async def get_token_price(session, token_address, network_name, gecko: GeckoTerminalClient) -> Optional[float]:
     """
-    Возвращает цену токена в USD. Приоритет: RPC-роутер -> CoinGecko.
+    Возвращает цену токена в USD через GeckoTerminal.
     """
-    addr = token_address.lower()
-
-    # 1. RPC-роутер (основной, надёжный даже для незалистенных токенов)
-    if hasattr(network, 'web3') and isinstance(network.web3, EVMWeb3Client):
-        try:
-            price = await network.web3.get_price_via_router(session, addr, weth_price_usd)
-            if price is not None:
-                return price
-        except Exception:
-            pass
-
-    # 2. CoinGecko (резерв)
-    platform = {"ethereum":"ethereum", "bsc":"binance-smart-chain", "solana":"solana"}.get(network_name)
-    if platform:
-        try:
-            url = f"https://api.coingecko.com/api/v3/simple/token_price/{platform}?contract_addresses={addr}&vs_currencies=usd"
-            async with session.get(url, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    price = data.get(addr, {}).get("usd")
-                    if price is not None:
-                        return float(price)
-        except Exception:
-            pass
-
-    return None
+    gecko_net = {"ethereum": "eth", "bsc": "bsc", "solana": "solana"}.get(network_name)
+    if not gecko_net:
+        return None
+    return await gecko.get_token_price(session, gecko_net, token_address)
 
 async def show_balance(query, context, network):
     address = context.user_data['address']
+    gecko = context.application.bot_data.get('geckoterminal')
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
             native_balance = await network.get_balance(address)
             token_balances = await network.get_token_balances(address)
+            logger.info(f"Получено токенов из сети {network.name}: {len(token_balances)}")
 
-            # Получаем цену нативного токена
             native_price = 0.0
             try:
                 coin_id = {"ethereum":"ethereum", "bsc":"binancecoin", "solana":"solana"}.get(network.name.lower())
-                if coin_id:
+                if coin_id and gecko:
+                    # Используем GeckoTerminal для нативного токена (заглушка, не реализовано)
+                    pass
+                if not native_price:
+                    # fallback CoinGecko для нативного (оставим на время)
                     price_url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
                     async with session.get(price_url, timeout=10) as resp:
                         if resp.status == 200:
@@ -232,19 +215,29 @@ async def show_balance(query, context, network):
             total_usd = native_balance * native_price
             lines = [f"💰 <b>Баланс сети {network.name}</b>\n"
                      f"{network.native_symbol}: {native_balance:.6f} (≈ ${native_balance * native_price:.2f})"]
+            unknown_count = 0
 
             for tok in token_balances:
-                price = await get_token_price(session, tok['address'], network.name, network, native_price)
+                if gecko:
+                    price = await get_token_price(session, tok['address'], network.name, gecko)
+                else:
+                    price = None
                 if price is None:
-                    continue
-                usd_val = tok['balance'] * price
-                if usd_val < MIN_USD_VALUE:
-                    continue
-                total_usd += usd_val
+                    price_display = "?"
+                    usd_val = 0.0
+                    unknown_count += 1
+                else:
+                    usd_val = tok['balance'] * price
+                    if usd_val < MIN_USD_VALUE:
+                        continue
+                    price_display = f"≈ ${usd_val:.2f}"
+                    total_usd += usd_val
                 link = f"https://dexscreener.com/{network.name.lower()}/{tok['address']}"
-                lines.append(f"• <a href='{link}'>{tok['symbol']}</a>: {tok['balance']:.4f} (≈ ${usd_val:.2f})")
+                lines.append(f"• <a href='{link}'>{tok['symbol']}</a>: {tok['balance']:.4f} ({price_display})")
 
             lines.insert(1, f"<b>Общий баланс: ≈ ${total_usd:.2f}</b>")
+            if unknown_count > 0:
+                lines.append(f"\n⚠️ Токенов с неизвестной ценой: {unknown_count}")
             text = "\n".join(lines)
             await _send_long_message(context.bot, query.message.chat_id, text, parse_mode="HTML")
             await query.edit_message_text("✅ Готово.")
