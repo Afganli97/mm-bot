@@ -2,16 +2,18 @@
 Сеть Ethereum.
 """
 import logging
-from typing import List, Dict, Set, Optional
+from typing import List, Dict, Optional
 from ._base import BaseNetwork
-from bot.api_clients import EVMExplorerClient, EVMWeb3Client, TokenInfoService
+from bot.api_clients import EVMExplorerClient, BlockscoutClient, EVMWeb3Client, TokenInfoService
 
 logger = logging.getLogger(__name__)
 
 class EthereumNetwork(BaseNetwork):
-    def __init__(self, network_config: dict, session, explorer_client: EVMExplorerClient, web3_client: EVMWeb3Client):
+    def __init__(self, network_config: dict, session, explorer_client: EVMExplorerClient,
+                 blockscout_client: BlockscoutClient, web3_client: EVMWeb3Client):
         super().__init__(network_config, session)
         self.explorer = explorer_client
+        self.blockscout = blockscout_client
         self.web3 = web3_client
 
     async def validate_address(self, address: str) -> bool:
@@ -19,55 +21,52 @@ class EthereumNetwork(BaseNetwork):
         return Web3.is_address(address)
 
     async def get_balance(self, address: str) -> float:
+        # Blockscout – основной
+        if self.blockscout:
+            try:
+                return await self.blockscout.get_native_balance(self.session, 1, address)
+            except Exception as e:
+                logger.warning(f"Blockscout native balance failed: {e}")
+        # Fallback Etherscan
         return await self.explorer.get_account_balance(self.session, address)
 
     async def get_token_balances(self, address: str) -> List[Dict]:
-        # Пробуем Alchemy getTokenBalances, иначе eth_getLogs (упрощённый подход)
-        if self.web3.is_alchemy if hasattr(self.web3, 'is_alchemy') else False:
+        if self.blockscout:
             try:
-                raw_balances = await self.web3.get_token_balances_alchemy(self.session, address)
+                raw_tokens = await self.blockscout.get_token_balances(self.session, 1, address)
                 result = []
-                for b in raw_balances:
-                    symbol = await TokenInfoService.get_symbol(self.session, b["address"], self.config["rpc_url"])
-                    decimals = await self._get_decimals(b["address"])
-                    balance = b["balance"] / 10**decimals if decimals else b["balance"] / 10**18
-                    if balance > 0:
-                        result.append({"address": b["address"], "symbol": symbol, "balance": balance, "decimals": decimals or 18})
+                for t in raw_tokens:
+                    bal = t["balance"] / (10 ** t["decimals"]) if t["decimals"] else t["balance"] / 10**18
+                    if bal > 0:
+                        result.append({
+                            "address": t["address"],
+                            "symbol": t["symbol"],
+                            "balance": bal,
+                            "decimals": t["decimals"]
+                        })
                 return result
             except Exception as e:
-                logger.warning(f"Alchemy getTokenBalances не сработал для Ethereum: {e}")
+                logger.warning(f"Blockscout token list failed: {e}")
+        # Fallback Etherscan (упрощённо)
+        txs = await self.explorer.get_token_transfers(self.session, address)
+        balances = {}
+        weth = self.config["weth"].lower()
+        for tx in txs:
+            contract = tx['contractAddress'].lower()
+            if contract == weth:
+                continue
+            if tx['to'].lower() == address.lower():
+                balances[contract] = balances.get(contract, 0) + int(tx['value'])
+            if tx['from'].lower() == address.lower():
+                balances[contract] = balances.get(contract, 0) - int(tx['value'])
+        result = []
+        for contract, bal in balances.items():
+            if bal > 0:
+                symbol = await TokenInfoService.get_symbol(self.session, contract, self.config["rpc_url"])
+                result.append({"address": contract, "symbol": symbol, "balance": bal / 10**18, "decimals": 18})
+        return result
 
-        # Fallback – последние 10000 блоков
-        current_block = await self.web3.get_current_block(self.session)
-        from_block = max(0, current_block - 10000)
-        token_addresses = await self.web3.get_token_list(self.session, address, from_block, current_block)
-        results = []
-        for token in token_addresses:
-            try:
-                balance = await self.web3.get_balance_of(self.session, token, address)
-                if balance == 0:
-                    continue
-                symbol = await TokenInfoService.get_symbol(self.session, token, self.config["rpc_url"])
-                decimals = await self._get_decimals(token)
-                bal = balance / (10 ** decimals) if decimals else balance / 10**18
-                results.append({"address": token, "symbol": symbol, "balance": bal, "decimals": decimals or 18})
-            except Exception as e:
-                logger.warning(f"Ошибка получения баланса токена {token}: {e}")
-        return results
-
-    async def _get_decimals(self, token_address: str) -> int:
-        payload = {"jsonrpc":"2.0","method":"eth_call","params":[{"to": token_address, "data": "0x313ce567"}, "latest"],"id":1}
-        try:
-            async with self.session.post(self.config["rpc_url"], json=payload, timeout=5) as resp:
-                data = await resp.json()
-                if 'result' in data and data['result'] != '0x':
-                    return int(data['result'], 16)
-        except Exception:
-            pass
-        return 18
-
-    async def get_swap_history(self, address: str, start_time: int, end_time: int,
-                               min_amount_native: float, max_tokens: int) -> List[Dict]:
+    async def get_swap_history(self, address, start_time, end_time, min_amount_native, max_tokens):
         from bot.graph_traversal import GraphTraversal
         traversal = GraphTraversal(self.session, address, self, max_tokens=max_tokens, lookback_days=30)
         return await traversal.run()
