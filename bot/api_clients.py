@@ -1,5 +1,5 @@
 """
-Асинхронные клиенты для Etherscan, Blockscout, RPC (Alchemy/Infura), Solscan, CoinGecko.
+Асинхронные клиенты для Etherscan (Ethereum), Blockscout (все EVM), RPC (Alchemy/Infura), Solscan, GeckoTerminal.
 """
 import asyncio
 import logging
@@ -90,7 +90,6 @@ class APIKeyRotator:
                                 else:
                                     raise Exception(f"Etherscan: {data.get('result', 'Unknown error')}")
                             elif self.service == "blockscout":
-                                # Blockscout возвращает либо данные, либо сообщение об ошибке
                                 if data.get("status") == "1" or "result" in data:
                                     increment_api_usage(self.service, idx)
                                     return data
@@ -188,10 +187,6 @@ class BlockscoutClient:
         return int(data["result"]) / 10**18
 
     async def get_token_balances(self, session, chain_id: int, address: str) -> List[Dict]:
-        """
-        Возвращает список токенов с балансами через action=tokenlist.
-        Каждый элемент: {address, symbol, balance (в минимальных единицах), decimals}
-        """
         params = {"module": "account", "action": "tokenlist", "address": address, "chain_id": chain_id}
         data = await self.rotator.make_request(session, self.BASE_URL, params, delay=0.25, chain_id=chain_id)
         result = data.get("result", [])
@@ -206,6 +201,7 @@ class BlockscoutClient:
         return tokens
 
 class EVMWeb3Client:
+    """RPC-клиент, используемый для истории покупок и резервного получения баланса."""
     def __init__(self, rpc_url: str, chain_id: int, weth_address: str, router_address: str = None, stable_address: str = None):
         self.rpc_url = rpc_url
         self.chain_id = chain_id
@@ -236,41 +232,31 @@ class EVMWeb3Client:
             return int(result, 16)
         return 0
 
-    async def get_price_via_router(self, session, token_address: str, weth_price_usd: float) -> Optional[float]:
-        if not self.router_address or not self.stable_address:
-            return None
-        # 1. token -> WETH
+class GeckoTerminalClient:
+    """Клиент для получения цен токенов через GeckoTerminal API."""
+    BASE_URL = "https://api.geckoterminal.com/api/v1"
+
+    async def get_token_price(self, session: aiohttp.ClientSession, network: str, token_address: str) -> Optional[float]:
+        """
+        Возвращает цену токена в USD или None.
+        network: 'eth', 'bsc', 'solana'
+        """
+        url = f"{self.BASE_URL}/networks/{network}/tokens/{token_address}"
         try:
-            data = (f"0xd06ca61f"
-                    f"0000000000000000000000000000000000000000000000000de0b6b3a7640000"
-                    f"0000000000000000000000000000000000000000000000000000000000000040"
-                    f"0000000000000000000000000000000000000000000000000000000000000002"
-                    f"000000000000000000000000{token_address[2:]:0>64}"
-                    f"000000000000000000000000{self.weth_address[2:]:0>64}")
-            result = await self._rpc_call(session, "eth_call", [{"to": self.router_address, "data": data}, "latest"])
-            if result:
-                amounts_offset = int(result[2:66], 16)
-                weth_out = int(result[2 + amounts_offset + 64*2:], 16)
-                if weth_out > 0:
-                    return (weth_out / 1e18) * weth_price_usd
-        except Exception:
-            pass
-        # 2. token -> stablecoin
-        try:
-            data = (f"0xd06ca61f"
-                    f"0000000000000000000000000000000000000000000000000de0b6b3a7640000"
-                    f"0000000000000000000000000000000000000000000000000000000000000040"
-                    f"0000000000000000000000000000000000000000000000000000000000000002"
-                    f"000000000000000000000000{token_address[2:]:0>64}"
-                    f"000000000000000000000000{self.stable_address[2:]:0>64}")
-            result = await self._rpc_call(session, "eth_call", [{"to": self.router_address, "data": data}, "latest"])
-            if result:
-                amounts_offset = int(result[2:66], 16)
-                stable_out = int(result[2 + amounts_offset + 64*2:], 16)
-                if stable_out > 0:
-                    return stable_out / 1e18
-        except Exception:
-            pass
+            await asyncio.sleep(2.5)  # не более 30 запросов/мин
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    attrs = data.get("data", {}).get("attributes", {})
+                    price_str = attrs.get("price_usd")
+                    if price_str is not None:
+                        return float(price_str)
+                elif resp.status == 429:
+                    logger.warning("GeckoTerminal 429, пропускаем")
+                else:
+                    logger.warning(f"GeckoTerminal HTTP {resp.status} для {token_address}")
+        except Exception as e:
+            logger.warning(f"GeckoTerminal ошибка для {token_address}: {e}")
         return None
 
 class TokenInfoService:
@@ -314,35 +300,3 @@ class SolscanClient:
         url = f"{self.BASE_URL}/account/transactions?address={address}&limit={limit}"
         data = await self.rotator.make_request(session, url, headers={}, delay=0.3)
         return data.get("data", [])
-
-class CoingeckoClient:
-    BASE_URL = "https://api.coingecko.com/api/v3"
-    @staticmethod
-    async def get_top_100(session, network_name="ethereum") -> List[Dict]:
-        from bot.database import get_connection
-        from datetime import timedelta
-        import json
-        platform_map = {"ethereum": "ethereum", "bsc": "binance-smart-chain", "solana": "solana"}
-        platform = platform_map.get(network_name)
-        if not platform: return []
-        with get_connection() as conn:
-            row = conn.execute("SELECT tokens_json, updated_at FROM top_tokens_cache WHERE network=?",
-                               (network_name,)).fetchone()
-            if row and (datetime.utcnow() - datetime.fromisoformat(row['updated_at'])) < timedelta(hours=1):
-                return json.loads(row['tokens_json'])
-        url = f"{CoingeckoClient.BASE_URL}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=false"
-        if network_name == "bsc": url += "&category=binance-smart-chain"
-        async with session.get(url, timeout=30) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                tokens = []
-                for coin in data:
-                    addr = coin.get("platforms", {}).get(platform, "")
-                    if addr: tokens.append({"id": coin["id"], "symbol": coin["symbol"].upper(), "address": addr.lower()})
-                with get_connection() as conn:
-                    conn.execute("INSERT OR REPLACE INTO top_tokens_cache (network, updated_at, tokens_json) VALUES (?, ?, ?)",
-                                 (network_name, datetime.utcnow().isoformat(), json.dumps(tokens)))
-                    conn.commit()
-                return tokens
-            else:
-                raise Exception("CoinGecko API error")
