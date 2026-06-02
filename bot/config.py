@@ -10,7 +10,7 @@ load_dotenv()
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# Разрешённые пользователи
+# Разрешённые пользователи (только им бот отвечает)
 ALLOWED_USER_IDS = set()
 raw_ids = os.getenv("ALLOWED_USER_IDS", "")
 if raw_ids:
@@ -19,10 +19,12 @@ if raw_ids:
 # ---------- Ключи API ----------
 # Etherscan (только для Ethereum)
 ETHERSCAN_API_KEYS = [k.strip() for k in os.getenv("ETHERSCAN_API_KEYS", "").split(",") if k.strip()]
-# Alchemy (основной RPC для всех EVM, включая BSC)
+# Alchemy (основной RPC для всех EVM, включая BSC) – резерв
 ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "")
 # Infura (резервный RPC)
 INFURA_API_KEY = os.getenv("INFURA_API_KEY", "")
+# Blockscout API – основной источник балансов EVM
+BLOCKSCOUT_API_KEY = os.getenv("BLOCKSCOUT_API_KEY", "")
 
 # Solana
 SOLSCAN_API_KEY = os.getenv("SOLSCAN_API_KEY", "")
@@ -37,9 +39,8 @@ DEFAULT_MIN_TRANSFER_VALUE_ETH = 0.001
 DEFAULT_MAX_ADDRESSES = 2000
 DEFAULT_MAX_FOUND_TOKENS = 100
 
-# ---------- Генерация RPC URL для EVM (Alchemy / Infura) ----------
+# Генерация RPC URL для EVM (Alchemy / Infura) – на случай fallback
 def _evm_rpc_url(chain_id: int) -> str:
-    """Возвращает RPC URL для указанного chain_id, используя Alchemy или Infura."""
     if ALCHEMY_API_KEY:
         subdomains = {
             1: "eth-mainnet",
