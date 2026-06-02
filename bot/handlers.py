@@ -1,5 +1,6 @@
 """
 Обработчики команд Telegram.
+Доступ разрешён только пользователям из ALLOWED_USER_IDS.
 """
 import logging
 import asyncio
@@ -17,7 +18,7 @@ from bot.database import get_all_api_usage, get_user_setting, set_user_setting, 
 from bot.graph_traversal import GraphTraversal
 from bot.token_filter import update_top_tokens
 from bot.api_clients import (
-    EVMExplorerClient, EVMWeb3Client, SolscanClient, CoingeckoClient, TokenInfoService
+    EVMExplorerClient, BlockscoutClient, EVMWeb3Client, SolscanClient, CoingeckoClient, TokenInfoService
 )
 from bot.networks.ethereum import EthereumNetwork
 from bot.networks.bsc import BscNetwork
@@ -25,7 +26,7 @@ from bot.networks.solana import SolanaNetwork
 
 logger = logging.getLogger(__name__)
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
-MIN_USD_VALUE = 0.10
+MIN_USD_VALUE = 0.10   # минимальная стоимость токена для отображения (кроме нативного)
 
 def _get_global_session(context: ContextTypes.DEFAULT_TYPE):
     session = context.application.bot_data.get('session')
@@ -40,6 +41,7 @@ def web3_is_address(addr: str) -> bool:
 
 def get_network_for_address(address: str, session):
     networks = []
+    blockscout = session.context.application.bot_data.get('blockscout')
     if web3_is_address(address):
         # Ethereum
         eth_conf = NETWORKS["ethereum"]
@@ -49,7 +51,7 @@ def get_network_for_address(address: str, session):
             router_address=eth_conf.get("dex_routers", [""])[0],
             stable_address=eth_conf.get("stablecoins", [""])[0]
         )
-        networks.append(EthereumNetwork(eth_conf, session, eth_explorer, eth_web3))
+        networks.append(EthereumNetwork(eth_conf, session, eth_explorer, blockscout, eth_web3))
         # BSC
         bsc_conf = NETWORKS["bsc"]
         bsc_web3 = EVMWeb3Client(
@@ -57,7 +59,7 @@ def get_network_for_address(address: str, session):
             router_address=bsc_conf.get("dex_routers", [""])[0],
             stable_address=bsc_conf.get("stablecoins", [""])[0]
         )
-        networks.append(BscNetwork(bsc_conf, session, bsc_web3))
+        networks.append(BscNetwork(bsc_conf, session, blockscout, bsc_web3))
     try:
         from solders.pubkey import Pubkey
         Pubkey.from_string(address)
@@ -76,11 +78,23 @@ def _check_access(update: Update) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
-    await update.message.reply_text("👋 Привет! Я бот для анализа кошельков. Отправьте адрес, и я определю сеть. Затем выберите режим: баланс или история покупок.\n/help, /dashboard, /settings")
+    await update.message.reply_text(
+        "👋 Привет! Я бот для анализа кошельков. Отправьте адрес, и я определю сеть. "
+        "Затем выберите режим: баланс или история покупок.\n"
+        "/help, /dashboard, /settings"
+    )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
-    await update.message.reply_text("🔍 <b>Как пользоваться:</b>\n1. Отправьте адрес (Ethereum, BSC, Solana).\n2. Выберите действие.\n3. Для истории – бот найдет токены за 30 дней.\n/settings – изменить параметры.", parse_mode="HTML")
+    await update.message.reply_text(
+        "🔍 <b>Как пользоваться:</b>\n"
+        "1. Отправьте адрес кошелька (Ethereum, BSC, Solana).\n"
+        "2. Выберите действие: «Баланс» или «История покупок».\n"
+        "3. Для истории: бот найдет токены, купленные за последние 30 дней.\n"
+        "4. Исключаются стейблкоины и топ-100.\n"
+        "/settings - изменить параметры поиска.",
+        parse_mode="HTML"
+    )
 
 async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
@@ -100,14 +114,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = _get_global_session(context)
     networks = get_network_for_address(text, session)
     if not networks:
-        await update.message.reply_text("❌ Адрес не распознан.")
+        await update.message.reply_text("❌ Адрес не распознан ни в одной поддерживаемой сети.")
         return
     context.user_data['networks'] = networks
     context.user_data['address'] = text
     if len(networks) > 1:
         keyboard = [[InlineKeyboardButton(n.name, callback_data=f"net_{n.name}")] for n in networks]
         keyboard.append([InlineKeyboardButton("Все сети (история)", callback_data="net_all")])
-        await update.message.reply_text("Адрес найден в нескольких сетях. Выберите сеть:", reply_markup=InlineKeyboardMarkup(keyboard))
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Адрес найден в нескольких сетях. Выберите сеть:", reply_markup=reply_markup)
     else:
         await show_mode_menu(update, context, networks[0])
 
@@ -118,9 +133,13 @@ async def show_mode_menu(update_or_query, context, network):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     if hasattr(update_or_query, 'callback_query'):
-        await update_or_query.callback_query.edit_message_text(f"Выберите действие для сети {network.name}:", reply_markup=reply_markup)
+        await update_or_query.callback_query.edit_message_text(
+            f"Выберите действие для сети {network.name}:", reply_markup=reply_markup
+        )
     else:
-        await update_or_query.message.reply_text(f"Выберите действие для сети {network.name}:", reply_markup=reply_markup)
+        await update_or_query.message.reply_text(
+            f"Выберите действие для сети {network.name}:", reply_markup=reply_markup
+        )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -155,18 +174,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await run_history(query, context, network)
 
 async def get_token_price(session, token_address, network_name, network, weth_price_usd: float = 0.0) -> Optional[float]:
+    """
+    Возвращает цену токена в USD. Приоритет: RPC-роутер -> CoinGecko.
+    """
     addr = token_address.lower()
 
-    # 1. Специфичный метод сети (если есть)
-    if hasattr(network, 'get_token_price_usd'):
+    # 1. RPC-роутер (основной, надёжный даже для незалистенных токенов)
+    if hasattr(network, 'web3') and isinstance(network.web3, EVMWeb3Client):
         try:
-            price = await network.get_token_price_usd(session, addr)
+            price = await network.web3.get_price_via_router(session, addr, weth_price_usd)
             if price is not None:
                 return price
         except Exception:
             pass
 
-    # 2. CoinGecko
+    # 2. CoinGecko (резерв)
     platform = {"ethereum":"ethereum", "bsc":"binance-smart-chain", "solana":"solana"}.get(network_name)
     if platform:
         try:
@@ -180,15 +202,6 @@ async def get_token_price(session, token_address, network_name, network, weth_pr
         except Exception:
             pass
 
-    # 3. RPC-роутер для EVM
-    if hasattr(network, 'web3') and isinstance(network.web3, EVMWeb3Client):
-        try:
-            price = await network.web3.get_price_via_router(session, addr, weth_price_usd)
-            if price is not None:
-                return price
-        except Exception:
-            pass
-
     return None
 
 async def show_balance(query, context, network):
@@ -199,7 +212,7 @@ async def show_balance(query, context, network):
             native_balance = await network.get_balance(address)
             token_balances = await network.get_token_balances(address)
 
-            # Цена нативного токена
+            # Получаем цену нативного токена
             native_price = 0.0
             try:
                 coin_id = {"ethereum":"ethereum", "bsc":"binancecoin", "solana":"solana"}.get(network.name.lower())
@@ -244,11 +257,13 @@ async def run_history(query, context, network):
             max_tokens = int(get_user_setting(user_id, "max_tokens", str(DEFAULT_MAX_FOUND_TOKENS)))
             lookback_days = int(get_user_setting(user_id, "lookback_days", str(DEFAULT_LOOKBACK_DAYS)))
             max_depth = int(get_user_setting(user_id, "max_depth", str(DEFAULT_MAX_DEPTH)))
-            traversal = GraphTraversal(session, address, network, max_tokens=max_tokens, lookback_days=lookback_days, max_depth=max_depth)
+            traversal = GraphTraversal(session, address, network, max_tokens=max_tokens,
+                                       lookback_days=lookback_days, max_depth=max_depth)
             found = await traversal.run()
             if not found:
                 await query.edit_message_text("✅ Анализ завершён. Токены не найдены.")
                 return
+            # Уникальные токены
             unique = {}
             for item in found:
                 addr = item['token']
@@ -259,7 +274,10 @@ async def run_history(query, context, network):
                 link = f"https://dexscreener.com/{network.name.lower()}/{addr}"
                 token_lines.append(f"• <a href='{link}'>{data['symbol']}</a> (<code>{addr}</code>)")
             limit_note = "\n⚠️ <i>Достигнут лимит, поиск остановлен.</i>" if traversal.token_limit_reached else ""
-            report = f"✅ <b>Анализ завершён!</b>\nПроверено адресов: {traversal.total_addresses}\nНайдено уникальных токенов: {len(unique)}\n{limit_note}\n" + "\n".join(token_lines)
+            report = (f"✅ <b>Анализ завершён!</b>\n"
+                      f"Проверено адресов: {traversal.total_addresses}\n"
+                      f"Найдено уникальных токенов: {len(unique)}\n"
+                      f"{limit_note}\n" + "\n".join(token_lines))
             await _send_long_message(context.bot, query.message.chat_id, report, parse_mode="HTML")
             await query.edit_message_text("✅ Готово.")
     except Exception as e:
@@ -286,9 +304,7 @@ async def run_all_history(query, context, networks):
         addr = item['token']
         if addr not in unique:
             unique[addr] = item
-    lines = []
-    for addr, data in unique.items():
-        lines.append(f"• {data['symbol']} (<code>{addr}</code>)")
+    lines = [f"• {data['symbol']} (<code>{addr}</code>)" for addr, data in unique.items()]
     report = f"✅ <b>История по всем сетям</b>\nНайдено токенов: {len(lines)}\n" + "\n".join(lines)
     await _send_long_message(context.bot, query.message.chat_id, report, parse_mode="HTML")
     await query.edit_message_text("✅ Готово.")
@@ -319,7 +335,8 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"Макс. токенов: {settings_dict.get('max_tokens', DEFAULT_MAX_FOUND_TOKENS)}", callback_data="set_max_tokens")],
         [InlineKeyboardButton("Сбросить на умолчания", callback_data="reset_settings")]
     ]
-    await update.message.reply_text("⚙️ <b>Настройки</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("⚙️ <b>Настройки</b>", reply_markup=reply_markup, parse_mode="HTML")
 
 async def settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
