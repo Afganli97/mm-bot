@@ -5,10 +5,11 @@ import logging
 from aiohttp import ClientSession
 from telegram.ext import ApplicationBuilder
 
-from bot.config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, LOG_FILE, ETHERSCAN_API_KEYS
+from bot.config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, LOG_FILE, ETHERSCAN_API_KEYS, BLOCKSCOUT_API_KEY
 from bot.database import init_db
 from bot.handlers import register_handlers
 from bot.token_filter import update_top_tokens
+from bot.api_clients import BlockscoutClient, blockscout_rotator
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
@@ -19,10 +20,12 @@ logger = logging.getLogger(__name__)
 
 async def post_init(app):
     init_db()
-    # Инициализируем глобальную сессию для хендлеров (сохраним в bot_data)
     session = ClientSession()
     app.bot_data['session'] = session
-    # Обновим фильтры для всех сетей при старте
+    if BLOCKSCOUT_API_KEY and blockscout_rotator:
+        app.bot_data['blockscout'] = BlockscoutClient(blockscout_rotator)
+    else:
+        logger.warning("Blockscout API ключ не задан, балансы EVM будут через резервные методы")
     for net_name in ["ethereum", "bsc", "solana"]:
         await update_top_tokens(session, net_name)
     app.bot_data['etherscan_keys'] = ETHERSCAN_API_KEYS
