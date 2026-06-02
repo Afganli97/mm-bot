@@ -4,13 +4,14 @@
 import logging
 from typing import List, Dict
 from ._base import BaseNetwork
-from bot.api_clients import EVMWeb3Client, TokenInfoService
+from bot.api_clients import BlockscoutClient, EVMWeb3Client, TokenInfoService
 
 logger = logging.getLogger(__name__)
 
 class BscNetwork(BaseNetwork):
-    def __init__(self, network_config: dict, session, web3_client: EVMWeb3Client):
+    def __init__(self, network_config: dict, session, blockscout_client: BlockscoutClient, web3_client: EVMWeb3Client):
         super().__init__(network_config, session)
+        self.blockscout = blockscout_client
         self.web3 = web3_client
 
     async def validate_address(self, address: str) -> bool:
@@ -18,36 +19,32 @@ class BscNetwork(BaseNetwork):
         return Web3.is_address(address)
 
     async def get_balance(self, address: str) -> float:
+        if self.blockscout:
+            try:
+                return await self.blockscout.get_native_balance(self.session, 56, address)
+            except Exception as e:
+                logger.warning(f"Blockscout native balance BSC failed: {e}")
         return await self.web3.get_balance(self.session, address)
 
     async def get_token_balances(self, address: str) -> List[Dict]:
-        current_block = await self.web3.get_current_block(self.session)
-        from_block = max(0, current_block - 10000)
-        token_addresses = await self.web3.get_token_list(self.session, address, from_block, current_block)
-        results = []
-        for token in token_addresses:
+        if self.blockscout:
             try:
-                balance = await self.web3.get_balance_of(self.session, token, address)
-                if balance == 0:
-                    continue
-                symbol = await TokenInfoService.get_symbol(self.session, token, self.config["rpc_url"])
-                decimals = await self._get_decimals(token)
-                bal = balance / (10 ** decimals) if decimals else balance / 10**18
-                results.append({"address": token, "symbol": symbol, "balance": bal, "decimals": decimals or 18})
+                raw_tokens = await self.blockscout.get_token_balances(self.session, 56, address)
+                result = []
+                for t in raw_tokens:
+                    bal = t["balance"] / (10 ** t["decimals"]) if t["decimals"] else t["balance"] / 10**18
+                    if bal > 0:
+                        result.append({
+                            "address": t["address"],
+                            "symbol": t["symbol"],
+                            "balance": bal,
+                            "decimals": t["decimals"]
+                        })
+                return result
             except Exception as e:
-                logger.warning(f"Ошибка получения баланса токена {token}: {e}")
-        return results
-
-    async def _get_decimals(self, token_address: str) -> int:
-        payload = {"jsonrpc":"2.0","method":"eth_call","params":[{"to": token_address, "data": "0x313ce567"}, "latest"],"id":1}
-        try:
-            async with self.session.post(self.config["rpc_url"], json=payload, timeout=5) as resp:
-                data = await resp.json()
-                if 'result' in data and data['result'] != '0x':
-                    return int(data['result'], 16)
-        except Exception:
-            pass
-        return 18
+                logger.warning(f"Blockscout token list BSC failed: {e}")
+        # Fallback RPC – без сканирования, только balanceOf для известных токенов (пусто)
+        return []
 
     async def get_swap_history(self, address, start_time, end_time, min_amount_native, max_tokens):
         from bot.graph_traversal import GraphTraversal
