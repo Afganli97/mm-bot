@@ -1,5 +1,5 @@
 """
-Асинхронные клиенты для Etherscan (только Ethereum), RPC (Alchemy/Infura), Solscan, CoinGecko.
+Асинхронные клиенты для Etherscan, Blockscout, RPC (Alchemy/Infura), Solscan, CoinGecko.
 """
 import asyncio
 import logging
@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 from bot.config import (
     ETHERSCAN_API_KEYS,
+    BLOCKSCOUT_API_KEY,
     SOLSCAN_API_KEY, HELIUS_URL
 )
 from bot.database import increment_api_usage, get_api_usage_today
@@ -16,10 +17,10 @@ from bot.database import increment_api_usage, get_api_usage_today
 logger = logging.getLogger(__name__)
 
 ETHERSCAN_DAILY_LIMIT = 100_000
+BLOCKSCOUT_DAILY_LIMIT = 100_000   # кредитов
 SOLSCAN_DAILY_LIMIT = 100_000
 
 class APIKeyRotator:
-    """Ротация ключей с учётом использования."""
     def __init__(self, keys: List[str], service: str, daily_limit: int):
         self.keys = keys
         self.service = service
@@ -35,36 +36,35 @@ class APIKeyRotator:
                 (self.service, key_index, today)
             )
             conn.commit()
-            logger.debug(f"Сброшены старые счётчики для {self.service} ключ {key_index}")
 
     def get_available_key(self) -> Optional[tuple]:
         for i, key in enumerate(self.keys):
             self._reset_old_if_needed(i)
             used = get_api_usage_today(self.service, i)
-            logger.debug(f"{self.service} ключ {i}: использовано {used}/{self.daily_limit}")
             if used < self.daily_limit:
                 return key, i
         return None
 
-    async def make_request(self, session: aiohttp.ClientSession, url: str, params: dict = None,
-                           headers: dict = None, delay: float = 0.4, chain_id: int = None) -> dict:
-        if self.service == "etherscan":
+    async def make_request(self, session, url, params=None, headers=None, delay=0.4, chain_id=None):
+        if self.service in ("etherscan", "blockscout"):
             await asyncio.sleep(delay)
 
         for attempt in range(len(self.keys)):
             key_info = self.get_available_key()
             if not key_info:
-                logger.error(f"Все ключи сервиса {self.service} исчерпаны")
                 raise Exception(f"Лимит {self.service} исчерпан")
             key, idx = key_info
-
             if self.service == "etherscan":
                 params = params or {}
                 params["apikey"] = key
                 if chain_id is not None:
                     params["chainid"] = chain_id
+            elif self.service == "blockscout":
+                params = params or {}
+                params["apikey"] = key
+                if chain_id is not None:
+                    params["chain_id"] = chain_id
 
-            logger.debug(f"Запрос к {self.service}: URL={url}, params={params}")
             try:
                 if self.service == "solscan":
                     headers = headers or {}
@@ -74,10 +74,6 @@ class APIKeyRotator:
                             data = await resp.json()
                             increment_api_usage(self.service, idx)
                             return data
-                        elif resp.status == 429:
-                            continue
-                        else:
-                            raise Exception(f"Solscan HTTP {resp.status}")
                 else:
                     async with session.get(url, params=params, timeout=30) as resp:
                         if resp.status == 200:
@@ -90,11 +86,16 @@ class APIKeyRotator:
                                     increment_api_usage(self.service, idx)
                                     return data
                                 elif data.get("message") == "NOTOK" and "limit" in data.get("result", "").lower():
-                                    logger.warning(f"Etherscan ключ {idx} исчерпал лимит")
                                     continue
                                 else:
-                                    logger.error(f"Etherscan ошибка: {data}")
-                                    raise Exception(f"Etherscan: {data.get('result', 'Неизвестная ошибка')}")
+                                    raise Exception(f"Etherscan: {data.get('result', 'Unknown error')}")
+                            elif self.service == "blockscout":
+                                # Blockscout возвращает либо данные, либо сообщение об ошибке
+                                if data.get("status") == "1" or "result" in data:
+                                    increment_api_usage(self.service, idx)
+                                    return data
+                                else:
+                                    raise Exception(f"Blockscout: {data}")
                             else:
                                 increment_api_usage(self.service, idx)
                                 return data
@@ -108,21 +109,19 @@ class APIKeyRotator:
                 raise
         raise Exception("Все попытки запроса исчерпаны")
 
-# Ротаторы
 etherscan_rotator = APIKeyRotator(ETHERSCAN_API_KEYS, "etherscan", ETHERSCAN_DAILY_LIMIT)
+blockscout_rotator = APIKeyRotator([BLOCKSCOUT_API_KEY], "blockscout", BLOCKSCOUT_DAILY_LIMIT) if BLOCKSCOUT_API_KEY else None
 solscan_rotator = APIKeyRotator([SOLSCAN_API_KEY], "solscan", SOLSCAN_DAILY_LIMIT) if SOLSCAN_API_KEY else None
 
 class EVMExplorerClient:
-    """Клиент для Etherscan V2 API (используется только для Ethereum)."""
     BASE_URL = "https://api.etherscan.io/v2/api"
-
-    def __init__(self, chain_id: int, weth_address: str, delay: float = 0.4):
+    def __init__(self, chain_id: int, weth_address: str, delay=0.4):
         self.chain_id = chain_id
         self.weth_address = weth_address.lower()
         self.delay = delay
         self.rotator = etherscan_rotator
 
-    async def get_block_by_timestamp(self, session: aiohttp.ClientSession, timestamp: int) -> int:
+    async def get_block_by_timestamp(self, session, timestamp):
         params = {"module": "block", "action": "getblocknobytime", "timestamp": timestamp, "closest": "before"}
         data = await self.rotator.make_request(session, self.BASE_URL, params, delay=self.delay, chain_id=self.chain_id)
         return int(data["result"])
@@ -177,8 +176,36 @@ class EVMExplorerClient:
         data = await self.rotator.make_request(session, self.BASE_URL, params, delay=self.delay, chain_id=self.chain_id)
         return int(data["result"]) / 10**18
 
+class BlockscoutClient:
+    BASE_URL = "https://api.blockscout.com/v2/api"
+
+    def __init__(self, rotator: APIKeyRotator):
+        self.rotator = rotator
+
+    async def get_native_balance(self, session, chain_id: int, address: str) -> float:
+        params = {"module": "account", "action": "balance", "address": address, "chain_id": chain_id}
+        data = await self.rotator.make_request(session, self.BASE_URL, params, delay=0.25, chain_id=chain_id)
+        return int(data["result"]) / 10**18
+
+    async def get_token_balances(self, session, chain_id: int, address: str) -> List[Dict]:
+        """
+        Возвращает список токенов с балансами через action=tokenlist.
+        Каждый элемент: {address, symbol, balance (в минимальных единицах), decimals}
+        """
+        params = {"module": "account", "action": "tokenlist", "address": address, "chain_id": chain_id}
+        data = await self.rotator.make_request(session, self.BASE_URL, params, delay=0.25, chain_id=chain_id)
+        result = data.get("result", [])
+        tokens = []
+        for t in result:
+            tokens.append({
+                "address": t["contractAddress"],
+                "symbol": t.get("tokenSymbol", "?"),
+                "balance": int(t["balance"]),
+                "decimals": int(t.get("decimals", 18))
+            })
+        return tokens
+
 class EVMWeb3Client:
-    """Клиент для EVM‑сетей через JSON‑RPC (Alchemy/Infura)."""
     def __init__(self, rpc_url: str, chain_id: int, weth_address: str, router_address: str = None, stable_address: str = None):
         self.rpc_url = rpc_url
         self.chain_id = chain_id
@@ -202,23 +229,6 @@ class EVMWeb3Client:
         result = await self._rpc_call(session, "eth_getBalance", [address, "latest"])
         return int(result, 16) / 10**18
 
-    async def get_token_list(self, session, address, from_block, to_block) -> Set[str]:
-        transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-        tokens = set()
-        topic2 = "0x000000000000000000000000" + address[2:].lower()
-        params_in = [{"fromBlock": hex(from_block), "toBlock": hex(to_block),
-                      "topics": [transfer_topic, None, topic2]}]
-        topic1 = "0x000000000000000000000000" + address[2:].lower()
-        params_out = [{"fromBlock": hex(from_block), "toBlock": hex(to_block),
-                       "topics": [transfer_topic, topic1, None]}]
-        for params in (params_in, params_out):
-            logs = await self._rpc_call(session, "eth_getLogs", params)
-            for log in logs:
-                token = log["address"].lower()
-                if token != self.weth_address:
-                    tokens.add(token)
-        return tokens
-
     async def get_balance_of(self, session, token_address, owner_address) -> int:
         data = "0x70a08231" + "000000000000000000000000" + owner_address[2:]
         result = await self._rpc_call(session, "eth_call", [{"to": token_address, "data": data}, "latest"])
@@ -227,36 +237,25 @@ class EVMWeb3Client:
         return 0
 
     async def get_price_via_router(self, session, token_address: str, weth_price_usd: float) -> Optional[float]:
-        """
-        Определяет цену токена в USD через вызов getAmountsOut на DEX-роутере.
-        Маршрут: token -> WETH -> stablecoin, с учётом известной цены WETH в USD.
-        Возвращает float или None.
-        """
         if not self.router_address or not self.stable_address:
             return None
-
-        # 1. Количество токена за 1 WETH
-        weth_amount = 10**18  # 1 WETH
+        # 1. token -> WETH
         try:
-            token_unit = 10**18  # предполагаем 18 decimals (упрощённо)
             data = (f"0xd06ca61f"
-                    f"0000000000000000000000000000000000000000000000000de0b6b3a7640000"  # 1 токен
+                    f"0000000000000000000000000000000000000000000000000de0b6b3a7640000"
                     f"0000000000000000000000000000000000000000000000000000000000000040"
                     f"0000000000000000000000000000000000000000000000000000000000000002"
                     f"000000000000000000000000{token_address[2:]:0>64}"
                     f"000000000000000000000000{self.weth_address[2:]:0>64}")
             result = await self._rpc_call(session, "eth_call", [{"to": self.router_address, "data": data}, "latest"])
             if result:
-                # Декодируем массив amounts (последнее значение — сумма WETH)
                 amounts_offset = int(result[2:66], 16)
-                weth_out = int(result[2 + amounts_offset + 64*2:], 16)  # берём последнее число после смещения
+                weth_out = int(result[2 + amounts_offset + 64*2:], 16)
                 if weth_out > 0:
-                    token_price_in_weth = weth_out / 1e18
-                    return token_price_in_weth * weth_price_usd
-        except Exception as e:
-            logger.warning(f"RPC getAmountsOut failed for {token_address}: {e}")
-
-        # 2. Альтернативно: цена через пару token/stablecoin напрямую
+                    return (weth_out / 1e18) * weth_price_usd
+        except Exception:
+            pass
+        # 2. token -> stablecoin
         try:
             data = (f"0xd06ca61f"
                     f"0000000000000000000000000000000000000000000000000de0b6b3a7640000"
@@ -269,10 +268,9 @@ class EVMWeb3Client:
                 amounts_offset = int(result[2:66], 16)
                 stable_out = int(result[2 + amounts_offset + 64*2:], 16)
                 if stable_out > 0:
-                    return stable_out / 1e18  # считаем stablecoin с 18 decimals
+                    return stable_out / 1e18
         except Exception:
             pass
-
         return None
 
 class TokenInfoService:
