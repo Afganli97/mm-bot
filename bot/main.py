@@ -8,8 +8,7 @@ from telegram.ext import ApplicationBuilder
 from bot.config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, LOG_FILE, ETHERSCAN_API_KEYS, BLOCKSCOUT_API_KEY
 from bot.database import init_db
 from bot.handlers import register_handlers
-from bot.token_filter import update_top_tokens
-from bot.api_clients import BlockscoutClient, blockscout_rotator
+from bot.api_clients import BlockscoutClient, blockscout_rotator, GeckoTerminalClient
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
@@ -26,8 +25,8 @@ async def post_init(app):
         app.bot_data['blockscout'] = BlockscoutClient(blockscout_rotator)
     else:
         logger.warning("Blockscout API ключ не задан, балансы EVM будут через резервные методы")
-    for net_name in ["ethereum", "bsc", "solana"]:
-        await update_top_tokens(session, net_name)
+    # GeckoTerminal не требует ключа
+    app.bot_data['geckoterminal'] = GeckoTerminalClient()
     app.bot_data['etherscan_keys'] = ETHERSCAN_API_KEYS
 
 async def post_shutdown(app):
