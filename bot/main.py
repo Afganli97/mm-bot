@@ -5,10 +5,10 @@ import logging
 from aiohttp import ClientSession
 from telegram.ext import ApplicationBuilder
 
-from bot.config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, LOG_FILE, ETHERSCAN_API_KEYS, BLOCKSCOUT_API_KEY
+from bot.config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, LOG_FILE, ETHERSCAN_API_KEYS, ANKR_API_URL
 from bot.database import init_db
 from bot.handlers import register_handlers
-from bot.api_clients import BlockscoutClient, blockscout_rotator, GeckoTerminalClient
+from bot.api_clients import AnkrClient, CascadePriceFetcher
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
@@ -21,12 +21,8 @@ async def post_init(app):
     init_db()
     session = ClientSession()
     app.bot_data['session'] = session
-    if BLOCKSCOUT_API_KEY and blockscout_rotator:
-        app.bot_data['blockscout'] = BlockscoutClient(blockscout_rotator)
-    else:
-        logger.warning("Blockscout API ключ не задан, балансы EVM будут через резервные методы")
-    # GeckoTerminal не требует ключа
-    app.bot_data['geckoterminal'] = GeckoTerminalClient()
+    app.bot_data['ankr'] = AnkrClient(ANKR_API_URL)
+    app.bot_data['price_fetcher'] = CascadePriceFetcher()
     app.bot_data['etherscan_keys'] = ETHERSCAN_API_KEYS
 
 async def post_shutdown(app):
