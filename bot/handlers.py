@@ -1,6 +1,5 @@
 """
 Обработчики команд Telegram.
-Доступ разрешён только пользователям из ALLOWED_USER_IDS.
 """
 import logging
 import asyncio
@@ -12,12 +11,12 @@ from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters, 
 from bot.config import (
     TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, NETWORKS,
     DEFAULT_MAX_DEPTH, DEFAULT_LOOKBACK_DAYS, DEFAULT_MIN_TRANSFER_VALUE_ETH,
-    DEFAULT_MAX_FOUND_TOKENS
+    DEFAULT_MAX_FOUND_TOKENS, MIN_USD_VALUE
 )
 from bot.database import get_all_api_usage, get_user_setting, set_user_setting, get_user_settings_dict
 from bot.graph_traversal import GraphTraversal
 from bot.api_clients import (
-    EVMExplorerClient, BlockscoutClient, EVMWeb3Client, GeckoTerminalClient
+    EVMExplorerClient, AnkrClient, EVMWeb3Client, CascadePriceFetcher, TokenInfoService
 )
 from bot.networks.ethereum import EthereumNetwork
 from bot.networks.bsc import BscNetwork
@@ -25,7 +24,6 @@ from bot.networks.solana import SolanaNetwork
 
 logger = logging.getLogger(__name__)
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
-MIN_USD_VALUE = 0.10   # минимальная стоимость токена для отображения (кроме нативного)
 
 def _get_global_session(context: ContextTypes.DEFAULT_TYPE):
     session = context.application.bot_data.get('session')
@@ -39,38 +37,13 @@ def web3_is_address(addr: str) -> bool:
     from web3 import Web3
     return Web3.is_address(addr)
 
-def get_network_for_address(address: str, session, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Определяет сети, которым принадлежит адрес, и возвращает список объектов BaseNetwork.
-    """
-    networks = []
-    blockscout = context.application.bot_data.get('blockscout')
-    if web3_is_address(address):
-        # Ethereum
-        eth_conf = NETWORKS["ethereum"]
-        eth_explorer = EVMExplorerClient(eth_conf["chain_id"], eth_conf["weth"])
-        eth_web3 = EVMWeb3Client(
-            eth_conf["rpc_url"], eth_conf["chain_id"], eth_conf["weth"],
-            router_address=eth_conf.get("dex_routers", [""])[0],
-            stable_address=eth_conf.get("stablecoins", [""])[0]
-        )
-        networks.append(EthereumNetwork(eth_conf, session, eth_explorer, blockscout, eth_web3))
-        # BSC
-        bsc_conf = NETWORKS["bsc"]
-        bsc_web3 = EVMWeb3Client(
-            bsc_conf["rpc_url"], bsc_conf["chain_id"], bsc_conf["weth"],
-            router_address=bsc_conf.get("dex_routers", [""])[0],
-            stable_address=bsc_conf.get("stablecoins", [""])[0]
-        )
-        networks.append(BscNetwork(bsc_conf, session, blockscout, bsc_web3))
+def is_solana_address(addr: str) -> bool:
     try:
         from solders.pubkey import Pubkey
-        Pubkey.from_string(address)
-        sol_conf = NETWORKS["solana"]
-        networks.append(SolanaNetwork(sol_conf, session))
-    except Exception:
-        pass
-    return networks
+        Pubkey.from_string(addr)
+        return True
+    except:
+        return False
 
 def _check_access(update: Update) -> bool:
     user_id = update.effective_user.id
@@ -79,11 +52,11 @@ def _check_access(update: Update) -> bool:
         return False
     return True
 
+# Стандартные команды
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
     await update.message.reply_text(
-        "👋 Привет! Я бот для анализа кошельков. Отправьте адрес, и я определю сеть. "
-        "Затем выберите режим: баланс или история покупок.\n"
+        "👋 Привет! Я бот для анализа кошельков. Отправьте адрес, и я сразу покажу балансы.\n"
         "/help, /dashboard, /settings"
     )
 
@@ -91,10 +64,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
     await update.message.reply_text(
         "🔍 <b>Как пользоваться:</b>\n"
-        "1. Отправьте адрес кошелька (Ethereum, BSC, Solana).\n"
-        "2. Выберите действие: «Баланс» или «История покупок».\n"
-        "3. Для истории: бот найдет токены, купленные за последние 30 дней.\n"
-        "4. Исключаются стейблкоины и топ-100.\n"
+        "1. Отправьте адрес кошелька (EVM или Solana).\n"
+        "2. Бот мгновенно покажет балансы во всех поддерживаемых сетях.\n"
+        "3. Нажмите кнопку «История покупок», чтобы проанализировать торговую историю.\n"
         "/settings - изменить параметры поиска.",
         parse_mode="HTML"
     )
@@ -108,6 +80,7 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{service}: {count}\n"
     await update.message.reply_text(msg, parse_mode="HTML")
 
+# Основной обработчик
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
     if context.user_data.get('awaiting_setting'):
@@ -115,193 +88,181 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
     session = _get_global_session(context)
-    networks = get_network_for_address(text, session, context)
-    if not networks:
-        await update.message.reply_text("❌ Адрес не распознан ни в одной поддерживаемой сети.")
+
+    # Определяем тип адреса
+    if web3_is_address(text):
+        # EVM адрес
+        context.user_data['address'] = text
+        context.user_data['address_type'] = 'evm'
+        await update.message.reply_text("⏳ Собираю балансы Ethereum и BSC...")
+        await show_evm_balances(update, context)
+    elif is_solana_address(text):
+        context.user_data['address'] = text
+        context.user_data['address_type'] = 'solana'
+        await update.message.reply_text("⏳ Собираю баланс Solana...")
+        await show_solana_balance(update, context)
+    else:
+        await update.message.reply_text("❌ Адрес не распознан (ни EVM, ни Solana).")
         return
-    context.user_data['networks'] = networks
-    context.user_data['address'] = text
-    if len(networks) > 1:
-        keyboard = [[InlineKeyboardButton(n.name, callback_data=f"net_{n.name}")] for n in networks]
-        keyboard.append([InlineKeyboardButton("Все сети (история)", callback_data="net_all")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("Адрес найден в нескольких сетях. Выберите сеть:", reply_markup=reply_markup)
-    else:
-        await show_mode_menu(update, context, networks[0])
 
-async def show_mode_menu(update_or_query, context, network):
-    keyboard = [
-        [InlineKeyboardButton("💰 Баланс", callback_data=f"mode_balance_{network.name}")],
-        [InlineKeyboardButton("📜 История покупок", callback_data=f"mode_history_{network.name}")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if hasattr(update_or_query, 'callback_query'):
-        await update_or_query.callback_query.edit_message_text(
-            f"Выберите действие для сети {network.name}:", reply_markup=reply_markup
-        )
-    else:
-        await update_or_query.message.reply_text(
-            f"Выберите действие для сети {network.name}:", reply_markup=reply_markup
-        )
+async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    address = context.user_data['address']
+    ankr: AnkrClient = context.application.bot_data.get('ankr')
+    if not ankr:
+        await update.message.reply_text("❌ Ankr не настроен.")
+        return
 
+    try:
+        from aiohttp import ClientSession
+        async with ClientSession() as session:
+            data = await ankr.get_multichain_balances(session, address, chains=["eth", "bsc"])
+            if not data:
+                await update.message.reply_text("❌ Не удалось получить данные от Ankr.")
+                return
+
+            assets = data.get("assets", [])
+            total_usd = float(data.get("totalBalanceUsd", 0))
+            lines = [f"💰 <b>Баланс кошелька</b>\n<code>{address}</code>\n"
+                     f"Общая стоимость: ≈ ${total_usd:,.2f}\n"]
+
+            # Группируем по сетям
+            eth_assets = [a for a in assets if a.get("blockchain") == "eth"]
+            bsc_assets = [a for a in assets if a.get("blockchain") == "bsc"]
+
+            for chain_name, chain_assets, native_sym in [
+                ("Ethereum", eth_assets, "ETH"),
+                ("BSC", bsc_assets, "BNB")
+            ]:
+                lines.append(f"\n⛓️ <b>{chain_name}</b>")
+                for a in chain_assets:
+                    sym = a.get("tokenSymbol", "?")
+                    bal = float(a.get("balance", 0))
+                    usd_val = float(a.get("balanceUsd", 0))
+                    if usd_val < MIN_USD_VALUE and sym != native_sym:
+                        continue
+                    display = f"≈ ${usd_val:,.2f}" if usd_val > 0 else "?"
+                    contract = a.get("tokenAddress", "")
+                    link = f"https://dexscreener.com/{chain_name.lower()}/{contract}" if contract else ""
+                    if link:
+                        lines.append(f"• <a href='{link}'>{sym}</a>: {bal:.4f} ({display})")
+                    else:
+                        lines.append(f"• {sym}: {bal:.4f} ({display})")
+
+            text = "\n".join(lines)
+            await _send_long_message(context.bot, update.effective_chat.id, text, parse_mode="HTML")
+
+            # Добавляем кнопку «История покупок»
+            keyboard = [[InlineKeyboardButton("📜 История покупок", callback_data="history_evm")]]
+            await update.message.reply_text("Выберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    except Exception as e:
+        logger.exception("Ошибка получения EVM балансов")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    address = context.user_data['address']
+    try:
+        from aiohttp import ClientSession
+        async with ClientSession() as session:
+            # Нативный SOL
+            payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[address]}
+            async with session.post(NETWORKS["solana"]["rpc_url"], json=payload, timeout=10) as resp:
+                data = await resp.json()
+                sol_balance = data.get("result", {}).get("value", 0) / 1e9
+
+            # Цена SOL через Jupiter
+            sol_price = 0.0
+            try:
+                async with session.get("https://price.jup.ag/v4/price?ids=SOL") as r:
+                    if r.status == 200:
+                        j_data = await r.json()
+                        sol_price = float(j_data.get("data", {}).get("SOL", {}).get("price", 0))
+            except: pass
+
+            total_usd = sol_balance * sol_price
+            lines = [f"💰 <b>Баланс Solana</b>\n<code>{address}</code>\n"
+                     f"SOL: {sol_balance:.4f} (≈ ${total_usd:,.2f})"]
+
+            # Токены через Solscan
+            solscan = SolscanClient()
+            tokens = await solscan.get_token_balances(session, address)
+            for tok in tokens:
+                # Цену не получаем, показываем без USD
+                lines.append(f"• {tok['symbol']}: {tok['balance']:.4f} (?)")
+            text = "\n".join(lines)
+            await _send_long_message(context.bot, update.effective_chat.id, text, parse_mode="HTML")
+
+            keyboard = [[InlineKeyboardButton("📜 История покупок", callback_data="history_solana")]]
+            await update.message.reply_text("Выберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    except Exception as e:
+        logger.exception("Ошибка получения Solana баланса")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+# Обработчик кнопок
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    if data.startswith("net_"):
-        net_name = data[4:]
-        networks = context.user_data.get('networks', [])
-        if net_name == "all":
-            await query.edit_message_text("⏳ Запущен анализ истории по всем сетям...")
-            await run_all_history(query, context, networks)
-        else:
-            network = next((n for n in networks if n.name == net_name), None)
-            if network:
-                context.user_data['selected_network'] = network
-                await show_mode_menu(query, context, network)
-            else:
-                await query.edit_message_text("Сеть не найдена.")
-    elif data.startswith("mode_"):
-        parts = data.split("_")
-        action = parts[1]
-        net_name = "_".join(parts[2:])
-        network = next((n for n in context.user_data.get('networks', []) if n.name == net_name), None)
-        if not network:
-            await query.edit_message_text("Сеть не найдена.")
-            return
-        if action == "balance":
-            await query.edit_message_text(f"⏳ Загружаем баланс сети {net_name}...")
-            await show_balance(query, context, network)
-        elif action == "history":
-            await query.edit_message_text(f"⏳ Запущен анализ истории покупок ({net_name})...")
-            await run_history(query, context, network)
 
-async def get_token_price(session, token_address, network_name, gecko: GeckoTerminalClient) -> Optional[float]:
-    """
-    Возвращает цену токена в USD через GeckoTerminal.
-    """
-    gecko_net = {"ethereum": "eth", "bsc": "bsc", "solana": "solana"}.get(network_name)
-    if not gecko_net:
-        return None
-    return await gecko.get_token_price(session, gecko_net, token_address)
+    if data == "history_evm":
+        # Показываем выбор сети для EVM
+        keyboard = [
+            [InlineKeyboardButton("Ethereum", callback_data="history_eth")],
+            [InlineKeyboardButton("BSC", callback_data="history_bsc")]
+        ]
+        await query.edit_message_text("Выберите сеть для истории:", reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data == "history_solana":
+        await query.edit_message_text("⏳ Запущен анализ истории покупок Solana...")
+        await run_solana_history(query, context)
+    elif data.startswith("history_"):
+        chain = data.split("_")[1]
+        await query.edit_message_text(f"⏳ Запущен анализ истории покупок {chain}...")
+        await run_evm_history(query, context, chain)
 
-async def show_balance(query, context, network):
-    address = context.user_data['address']
-    gecko = context.application.bot_data.get('geckoterminal')
-    try:
-        from aiohttp import ClientSession
-        async with ClientSession() as session:
-            native_balance = await network.get_balance(address)
-            token_balances = await network.get_token_balances(address)
-            logger.info(f"Получено токенов из сети {network.name}: {len(token_balances)}")
-
-            native_price = 0.0
-            try:
-                coin_id = {"ethereum":"ethereum", "bsc":"binancecoin", "solana":"solana"}.get(network.name.lower())
-                if coin_id:
-                    # Используем CoinGecko для нативного токена (GeckoTerminal не даёт цену нативного токена)
-                    price_url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
-                    async with session.get(price_url, timeout=10) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            native_price = data.get(coin_id, {}).get("usd", 0.0)
-            except Exception:
-                pass
-
-            total_usd = native_balance * native_price
-            lines = [f"💰 <b>Баланс сети {network.name}</b>\n"
-                     f"{network.native_symbol}: {native_balance:.6f} (≈ ${native_balance * native_price:.2f})"]
-            unknown_count = 0
-
-            for tok in token_balances:
-                if gecko:
-                    price = await get_token_price(session, tok['address'], network.name, gecko)
-                else:
-                    price = None
-                if price is None:
-                    price_display = "?"
-                    usd_val = 0.0
-                    unknown_count += 1
-                else:
-                    usd_val = tok['balance'] * price
-                    if usd_val < MIN_USD_VALUE:
-                        continue
-                    price_display = f"≈ ${usd_val:.2f}"
-                    total_usd += usd_val
-                link = f"https://dexscreener.com/{network.name.lower()}/{tok['address']}"
-                lines.append(f"• <a href='{link}'>{tok['symbol']}</a>: {tok['balance']:.4f} ({price_display})")
-
-            lines.insert(1, f"<b>Общий баланс: ≈ ${total_usd:.2f}</b>")
-            if unknown_count > 0:
-                lines.append(f"\n⚠️ Токенов с неизвестной ценой: {unknown_count}")
-            text = "\n".join(lines)
-            await _send_long_message(context.bot, query.message.chat_id, text, parse_mode="HTML")
-            await query.edit_message_text("✅ Готово.")
-    except Exception as e:
-        logger.exception("Ошибка баланса")
-        await query.edit_message_text(f"❌ Ошибка: {e}")
-
-async def run_history(query, context, network):
+async def run_evm_history(query, context, chain: str):
     address = context.user_data['address']
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
-            user_id = query.from_user.id
-            max_tokens = int(get_user_setting(user_id, "max_tokens", str(DEFAULT_MAX_FOUND_TOKENS)))
-            lookback_days = int(get_user_setting(user_id, "lookback_days", str(DEFAULT_LOOKBACK_DAYS)))
-            max_depth = int(get_user_setting(user_id, "max_depth", str(DEFAULT_MAX_DEPTH)))
-            traversal = GraphTraversal(session, address, network, max_tokens=max_tokens,
-                                       lookback_days=lookback_days, max_depth=max_depth)
+            # Создаём сетевой объект в зависимости от выбора
+            if chain == "eth":
+                conf = NETWORKS["ethereum"]
+                explorer = EVMExplorerClient(conf["chain_id"], conf["weth"])
+                web3 = EVMWeb3Client(conf["rpc_url"], conf["chain_id"], conf["weth"],
+                                     router_address=conf.get("dex_routers", [""])[0],
+                                     stable_address=conf.get("stablecoins", [""])[0])
+                network = EthereumNetwork(conf, session, explorer, web3)
+            else:  # bsc
+                conf = NETWORKS["bsc"]
+                web3 = EVMWeb3Client(conf["rpc_url"], conf["chain_id"], conf["weth"],
+                                     router_address=conf.get("dex_routers", [""])[0],
+                                     stable_address=conf.get("stablecoins", [""])[0])
+                network = BscNetwork(conf, session, web3)
+
+            traversal = GraphTraversal(session, address, network, max_tokens=100, lookback_days=30, max_depth=3)
             found = await traversal.run()
             if not found:
                 await query.edit_message_text("✅ Анализ завершён. Токены не найдены.")
                 return
-            # Уникальные токены
             unique = {}
             for item in found:
                 addr = item['token']
                 if addr not in unique:
                     unique[addr] = item
-            token_lines = []
-            for addr, data in unique.items():
-                link = f"https://dexscreener.com/{network.name.lower()}/{addr}"
-                token_lines.append(f"• <a href='{link}'>{data['symbol']}</a> (<code>{addr}</code>)")
-            limit_note = "\n⚠️ <i>Достигнут лимит, поиск остановлен.</i>" if traversal.token_limit_reached else ""
-            report = (f"✅ <b>Анализ завершён!</b>\n"
-                      f"Проверено адресов: {traversal.total_addresses}\n"
-                      f"Найдено уникальных токенов: {len(unique)}\n"
-                      f"{limit_note}\n" + "\n".join(token_lines))
+            token_lines = [f"• <a href='https://dexscreener.com/{chain}/{addr}'>{data['symbol']}</a> (<code>{addr}</code>)" for addr, data in unique.items()]
+            report = f"✅ <b>История покупок {chain.upper()}</b>\nНайдено токенов: {len(unique)}\n" + "\n".join(token_lines)
             await _send_long_message(context.bot, query.message.chat_id, report, parse_mode="HTML")
             await query.edit_message_text("✅ Готово.")
     except Exception as e:
-        logger.exception("Ошибка истории")
+        logger.exception("Ошибка истории EVM")
         await query.edit_message_text(f"❌ Ошибка: {e}")
 
-async def run_all_history(query, context, networks):
-    address = context.user_data['address']
-    all_found = []
-    for net in networks:
-        try:
-            from aiohttp import ClientSession
-            async with ClientSession() as session:
-                traversal = GraphTraversal(session, address, net, max_tokens=50)
-                found = await traversal.run()
-                all_found.extend(found)
-        except Exception:
-            pass
-    if not all_found:
-        await query.edit_message_text("Токены не найдены ни в одной сети.")
-        return
-    unique = {}
-    for item in all_found:
-        addr = item['token']
-        if addr not in unique:
-            unique[addr] = item
-    lines = [f"• {data['symbol']} (<code>{addr}</code>)" for addr, data in unique.items()]
-    report = f"✅ <b>История по всем сетям</b>\nНайдено токенов: {len(lines)}\n" + "\n".join(lines)
-    await _send_long_message(context.bot, query.message.chat_id, report, parse_mode="HTML")
-    await query.edit_message_text("✅ Готово.")
+async def run_solana_history(query, context):
+    # Заглушка
+    await query.edit_message_text("📜 История покупок для Solana пока недоступна.")
 
+# Вспомогательные функции
 async def _send_long_message(bot, chat_id, text, parse_mode="HTML"):
     if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
         await bot.send_message(chat_id, text, parse_mode=parse_mode, disable_web_page_preview=True)
@@ -317,6 +278,7 @@ async def _send_long_message(bot, chat_id, text, parse_mode="HTML"):
         if chunk:
             await bot.send_message(chat_id, chunk.strip(), parse_mode=parse_mode, disable_web_page_preview=True)
 
+# Обработчики настроек (оставлены как раньше, но можно перенести из предыдущей версии)
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
     user_id = update.effective_user.id
@@ -370,5 +332,5 @@ def register_handlers(app):
     app.add_handler(CommandHandler("dashboard", dashboard))
     app.add_handler(CommandHandler("settings", settings))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(net_|mode_).*"))
+    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(history_|history_eth|history_bsc|history_solana)$"))
     app.add_handler(CallbackQueryHandler(settings_button, pattern="^(set_|reset_settings).*"))
