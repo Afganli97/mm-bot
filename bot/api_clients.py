@@ -1,5 +1,5 @@
 """
-Асинхронные клиенты для Etherscan (Ethereum), Blockscout (все EVM), RPC (Alchemy/Infura), Solscan, GeckoTerminal.
+Клиенты для Etherscan, Ankr Multichain, RPC, Solscan, каскадного определения цен.
 """
 import asyncio
 import logging
@@ -8,19 +8,19 @@ import aiohttp
 from datetime import datetime, timezone
 
 from bot.config import (
-    ETHERSCAN_API_KEYS,
-    BLOCKSCOUT_API_KEY,
-    SOLSCAN_API_KEY, HELIUS_URL
+    ETHERSCAN_API_KEYS, ANKR_API_URL,
+    SOLSCAN_API_KEY, HELIUS_URL, NETWORKS
 )
 from bot.database import increment_api_usage, get_api_usage_today
 
 logger = logging.getLogger(__name__)
 
 ETHERSCAN_DAILY_LIMIT = 100_000
-BLOCKSCOUT_DAILY_LIMIT = 100_000   # кредитов
 SOLSCAN_DAILY_LIMIT = 100_000
+ANKR_DAILY_LIMIT = 100_000   # условно, лимитов нет, но ведём учёт
 
 class APIKeyRotator:
+    """Ротация ключей с учётом использования."""
     def __init__(self, keys: List[str], service: str, daily_limit: int):
         self.keys = keys
         self.service = service
@@ -46,9 +46,8 @@ class APIKeyRotator:
         return None
 
     async def make_request(self, session, url, params=None, headers=None, delay=0.4, chain_id=None):
-        if self.service in ("etherscan", "blockscout"):
+        if self.service in ("etherscan",):
             await asyncio.sleep(delay)
-
         for attempt in range(len(self.keys)):
             key_info = self.get_available_key()
             if not key_info:
@@ -59,12 +58,6 @@ class APIKeyRotator:
                 params["apikey"] = key
                 if chain_id is not None:
                     params["chainid"] = chain_id
-            elif self.service == "blockscout":
-                params = params or {}
-                params["apikey"] = key
-                if chain_id is not None:
-                    params["chain_id"] = chain_id
-
             try:
                 if self.service == "solscan":
                     headers = headers or {}
@@ -89,12 +82,6 @@ class APIKeyRotator:
                                     continue
                                 else:
                                     raise Exception(f"Etherscan: {data.get('result', 'Unknown error')}")
-                            elif self.service == "blockscout":
-                                if data.get("status") == "1" or "result" in data:
-                                    increment_api_usage(self.service, idx)
-                                    return data
-                                else:
-                                    raise Exception(f"Blockscout: {data}")
                             else:
                                 increment_api_usage(self.service, idx)
                                 return data
@@ -109,10 +96,10 @@ class APIKeyRotator:
         raise Exception("Все попытки запроса исчерпаны")
 
 etherscan_rotator = APIKeyRotator(ETHERSCAN_API_KEYS, "etherscan", ETHERSCAN_DAILY_LIMIT)
-blockscout_rotator = APIKeyRotator([BLOCKSCOUT_API_KEY], "blockscout", BLOCKSCOUT_DAILY_LIMIT) if BLOCKSCOUT_API_KEY else None
 solscan_rotator = APIKeyRotator([SOLSCAN_API_KEY], "solscan", SOLSCAN_DAILY_LIMIT) if SOLSCAN_API_KEY else None
 
 class EVMExplorerClient:
+    """Клиент для Etherscan V2 API (история Ethereum)."""
     BASE_URL = "https://api.etherscan.io/v2/api"
     def __init__(self, chain_id: int, weth_address: str, delay=0.4):
         self.chain_id = chain_id
@@ -175,33 +162,43 @@ class EVMExplorerClient:
         data = await self.rotator.make_request(session, self.BASE_URL, params, delay=self.delay, chain_id=self.chain_id)
         return int(data["result"]) / 10**18
 
-class BlockscoutClient:
-    BASE_URL = "https://api.blockscout.com/v2/api"
+class AnkrClient:
+    """Клиент для Ankr Advanced API (балансы всех EVM сетей)."""
+    def __init__(self, api_url: str):
+        self.api_url = api_url
 
-    def __init__(self, rotator: APIKeyRotator):
-        self.rotator = rotator
-
-    async def get_native_balance(self, session, chain_id: int, address: str) -> float:
-        params = {"module": "account", "action": "balance", "address": address, "chain_id": chain_id}
-        data = await self.rotator.make_request(session, self.BASE_URL, params, delay=0.25, chain_id=chain_id)
-        return int(data["result"]) / 10**18
-
-    async def get_token_balances(self, session, chain_id: int, address: str) -> List[Dict]:
-        params = {"module": "account", "action": "tokenlist", "address": address, "chain_id": chain_id}
-        data = await self.rotator.make_request(session, self.BASE_URL, params, delay=0.25, chain_id=chain_id)
-        result = data.get("result", [])
-        tokens = []
-        for t in result:
-            tokens.append({
-                "address": t["contractAddress"],
-                "symbol": t.get("tokenSymbol", "?"),
-                "balance": int(t["balance"]),
-                "decimals": int(t.get("decimals", 18))
-            })
-        return tokens
+    async def get_multichain_balances(self, session: aiohttp.ClientSession, address: str, chains: List[str] = None) -> Dict:
+        """
+        Возвращает балансы для указанных сетей (по умолчанию ['eth','bsc']).
+        Ответ: { totalBalanceUsd, assets: [ { blockchain, tokenSymbol, balance, balanceUsd, tokenDecimals, tokenAddress } ] }
+        """
+        if chains is None:
+            chains = ["eth", "bsc"]
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "ankr_getAccountBalance",
+            "params": {
+                "blockchain": chains,
+                "walletAddress": address
+            },
+            "id": 1
+        }
+        try:
+            async with session.post(self.api_url, json=payload, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    logger.debug(f"Ankr response: {data}")
+                    increment_api_usage("ankr", 0)  # учёт
+                    return data.get("result", {})
+                else:
+                    text = await resp.text()
+                    logger.error(f"Ankr HTTP {resp.status}: {text}")
+        except Exception as e:
+            logger.error(f"Ankr request failed: {e}")
+        return {}
 
 class EVMWeb3Client:
-    """RPC-клиент, используемый для истории покупок и резервного получения баланса."""
+    """RPC-клиент для истории покупок и прямого расчета цен."""
     def __init__(self, rpc_url: str, chain_id: int, weth_address: str, router_address: str = None, stable_address: str = None):
         self.rpc_url = rpc_url
         self.chain_id = chain_id
@@ -232,31 +229,91 @@ class EVMWeb3Client:
             return int(result, 16)
         return 0
 
-class GeckoTerminalClient:
-    """Клиент для получения цен токенов через GeckoTerminal API."""
-    BASE_URL = "https://api.geckoterminal.com/api/v1"
-
-    async def get_token_price(self, session: aiohttp.ClientSession, network: str, token_address: str) -> Optional[float]:
-        """
-        Возвращает цену токена в USD или None.
-        network: 'eth', 'bsc', 'solana'
-        """
-        url = f"{self.BASE_URL}/networks/{network}/tokens/{token_address}"
+    async def get_price_via_router(self, session, token_address: str, weth_price_usd: float) -> Optional[float]:
+        """Прямой расчёт цены через Router (токен -> WETH -> stablecoin)."""
+        if not self.router_address or not self.stable_address:
+            return None
         try:
-            await asyncio.sleep(2.5)  # не более 30 запросов/мин
-            async with session.get(url, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    attrs = data.get("data", {}).get("attributes", {})
-                    price_str = attrs.get("price_usd")
-                    if price_str is not None:
-                        return float(price_str)
-                elif resp.status == 429:
-                    logger.warning("GeckoTerminal 429, пропускаем")
-                else:
-                    logger.warning(f"GeckoTerminal HTTP {resp.status} для {token_address}")
+            # Узнаём decimals токена
+            decimals = await self._get_decimals(session, token_address)
+            amount_in = 10 ** decimals
+            path = [token_address, self.weth_address, self.stable_address]
+            data = ("0xd06ca61f"
+                    f"{amount_in:064x}"
+                    f"0000000000000000000000000000000000000000000000000000000000000040"
+                    f"0000000000000000000000000000000000000000000000000000000000000003"
+                    f"000000000000000000000000{token_address[2:].lower():0>64}"
+                    f"000000000000000000000000{self.weth_address[2:]:0>64}"
+                    f"000000000000000000000000{self.stable_address[2:]:0>64}")
+            result = await self._rpc_call(session, "eth_call", [{"to": self.router_address, "data": data}, "latest"])
+            if result:
+                amounts_offset = int(result[2:66], 16)
+                # Последнее значение в массиве – количество стейблкоина
+                stable_out = int(result[2 + amounts_offset + 64*2:], 16)
+                if stable_out > 0:
+                    # Для USDT/BUSD decimals = 18 в Pancake, но для USDC 6? Будем считать 18 для простоты
+                    return stable_out / 10**18
         except Exception as e:
-            logger.warning(f"GeckoTerminal ошибка для {token_address}: {e}")
+            logger.debug(f"Router price failed for {token_address}: {e}")
+        return None
+
+    async def _get_decimals(self, session, token_address: str) -> int:
+        payload = {"jsonrpc":"2.0","method":"eth_call","params":[{"to": token_address, "data": "0x313ce567"}, "latest"],"id":1}
+        try:
+            result = await self._rpc_call(session, "eth_call", [{"to": token_address, "data": "0x313ce567"}, "latest"])
+            if result:
+                return int(result, 16)
+        except:
+            pass
+        return 18
+
+class CascadePriceFetcher:
+    """Каскадное определение цены: DexScreener -> GeckoTerminal -> RPC-роутер."""
+    DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens"
+    GECKO_URL = "https://api.geckoterminal.com/api/v1/networks/{network}/tokens/{address}"
+
+    def __init__(self):
+        self._semaphore = asyncio.Semaphore(10)
+
+    async def get_price(self, session: aiohttp.ClientSession, chain: str, token_address: str, web3_client: EVMWeb3Client = None, weth_price: float = 0.0) -> Optional[float]:
+        """Возвращает цену в USD или None."""
+        async with self._semaphore:
+            # 1. DexScreener
+            try:
+                url = f"{self.DEXSCREENER_URL}/{token_address}"
+                async with session.get(url, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        pairs = data.get("pairs")
+                        if pairs and pairs[0].get("priceUsd"):
+                            return float(pairs[0]["priceUsd"])
+            except Exception as e:
+                logger.debug(f"DexScreener failed for {token_address}: {e}")
+
+            await asyncio.sleep(0.2)
+
+            # 2. GeckoTerminal
+            gecko_network = {"ethereum": "eth", "bsc": "bsc", "eth": "eth"}.get(chain.lower(), chain.lower())
+            try:
+                url = self.GECKO_URL.format(network=gecko_network, address=token_address)
+                async with session.get(url, timeout=5) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        price = data.get("data", {}).get("attributes", {}).get("price_usd")
+                        if price:
+                            return float(price)
+            except Exception as e:
+                logger.debug(f"GeckoTerminal failed for {token_address}: {e}")
+
+            await asyncio.sleep(0.2)
+
+            # 3. Прямой RPC-роутер (если передан web3_client)
+            if web3_client:
+                try:
+                    return await web3_client.get_price_via_router(session, token_address, weth_price)
+                except Exception as e:
+                    logger.debug(f"RPC router failed for {token_address}: {e}")
+
         return None
 
 class TokenInfoService:
@@ -294,9 +351,3 @@ class SolscanClient:
                     "decimals": item["decimals"]
                 })
         return tokens
-
-    async def get_transactions(self, session, address, limit=50):
-        if not self.rotator: return []
-        url = f"{self.BASE_URL}/account/transactions?address={address}&limit={limit}"
-        data = await self.rotator.make_request(session, url, headers={}, delay=0.3)
-        return data.get("data", [])
