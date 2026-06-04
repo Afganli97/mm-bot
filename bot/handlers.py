@@ -16,7 +16,7 @@ from bot.config import (
 from bot.database import get_all_api_usage, get_user_setting, set_user_setting, get_user_settings_dict
 from bot.graph_traversal import GraphTraversal
 from bot.api_clients import (
-    EVMExplorerClient, AnkrClient, EVMWeb3Client, CascadePriceFetcher, TokenInfoService, SolscanClient
+    EVMExplorerClient, AnkrClient, EVMWeb3Client, CascadePriceFetcher, TokenInfoService
 )
 from bot.networks.ethereum import EthereumNetwork
 from bot.networks.bsc import BscNetwork
@@ -164,13 +164,58 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
-            # Нативный SOL
+            rpc_url = NETWORKS["solana"]["rpc_url"]
+
+            # 1. Нативный SOL
             payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[address]}
-            async with session.post(NETWORKS["solana"]["rpc_url"], json=payload, timeout=10) as resp:
+            async with session.post(rpc_url, json=payload, timeout=10) as resp:
                 data = await resp.json()
                 sol_balance = data.get("result", {}).get("value", 0) / 1e9
 
-            # Цена SOL через Jupiter
+            # 2. Токены через getTokenAccountsByOwner
+            token_payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTokenAccountsByOwner",
+                "params": [
+                    address,
+                    {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                    {"encoding": "jsonParsed"}
+                ]
+            }
+            tokens = []
+            async with session.post(rpc_url, json=token_payload, timeout=10) as resp:
+                if resp.status == 200:
+                    token_data = await resp.json()
+                    accounts = token_data.get("result", {}).get("value", [])
+                    for acc in accounts:
+                        info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+                        mint = info.get("mint")
+                        symbol = info.get("tokenSymbol", "?")
+                        decimals = info.get("tokenAmount", {}).get("decimals", 0)
+                        amount = info.get("tokenAmount", {}).get("uiAmount", 0)
+                        if amount > 0 and mint:
+                            tokens.append({
+                                "mint": mint,
+                                "symbol": symbol,
+                                "balance": amount,
+                                "decimals": decimals
+                            })
+
+            # 3. Цены через Jupiter (массовый запрос)
+            prices = {}
+            if tokens:
+                mint_ids = ",".join([t["mint"] for t in tokens])
+                try:
+                    async with session.get(f"https://price.jup.ag/v4/price?ids={mint_ids}") as resp:
+                        if resp.status == 200:
+                            j_data = await resp.json()
+                            for mint, info in j_data.get("data", {}).items():
+                                prices[mint] = float(info.get("price", 0))
+                except Exception as e:
+                    logger.warning(f"Ошибка получения цен Jupiter: {e}")
+
+            # 4. Цена SOL
             sol_price = 0.0
             try:
                 async with session.get("https://price.jup.ag/v4/price?ids=SOL") as r:
@@ -180,15 +225,28 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
             except: pass
 
             total_usd = sol_balance * sol_price
+
             lines = [f"💰 <b>Баланс Solana</b>\n<code>{address}</code>\n"
                      f"SOL: {sol_balance:.4f} (≈ ${total_usd:,.2f})"]
 
-            # Токены через Solscan
-            solscan = SolscanClient()
-            tokens = await solscan.get_token_balances(session, address)
+            unknown_count = 0
             for tok in tokens:
-                # Цену не получаем, показываем без USD
-                lines.append(f"• {tok['symbol']}: {tok['balance']:.4f} (?)")
+                price = prices.get(tok["mint"])
+                if price is not None:
+                    usd_val = tok["balance"] * price
+                    if usd_val < MIN_USD_VALUE:
+                        continue
+                    price_display = f"≈ ${usd_val:.2f}"
+                    total_usd += usd_val
+                else:
+                    price_display = "?"
+                    unknown_count += 1
+                lines.append(f"• {tok['symbol']}: {tok['balance']:.4f} ({price_display})")
+
+            lines.insert(1, f"<b>Общая стоимость: ≈ ${total_usd:,.2f}</b>")
+            if unknown_count > 0:
+                lines.append(f"\n⚠️ Токенов с неизвестной ценой: {unknown_count}")
+
             text = "\n".join(lines)
             await _send_long_message(context.bot, update.effective_chat.id, text, parse_mode="HTML")
 
