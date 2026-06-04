@@ -16,7 +16,7 @@ from bot.config import (
 from bot.database import get_all_api_usage, get_user_setting, set_user_setting, get_user_settings_dict
 from bot.graph_traversal import GraphTraversal
 from bot.api_clients import (
-    EVMExplorerClient, AnkrClient, EVMWeb3Client, CascadePriceFetcher, TokenInfoService
+    EVMExplorerClient, AnkrClient, EVMWeb3Client, CascadePriceFetcher, TokenInfoService, SolscanClient
 )
 from bot.networks.ethereum import EthereumNetwork
 from bot.networks.bsc import BscNetwork
@@ -206,7 +206,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "history_evm":
-        # Показываем выбор сети для EVM
         keyboard = [
             [InlineKeyboardButton("Ethereum", callback_data="history_eth")],
             [InlineKeyboardButton("BSC", callback_data="history_bsc")]
@@ -225,7 +224,6 @@ async def run_evm_history(query, context, chain: str):
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
-            # Создаём сетевой объект в зависимости от выбора
             if chain == "eth":
                 conf = NETWORKS["ethereum"]
                 explorer = EVMExplorerClient(conf["chain_id"], conf["weth"])
@@ -259,10 +257,8 @@ async def run_evm_history(query, context, chain: str):
         await query.edit_message_text(f"❌ Ошибка: {e}")
 
 async def run_solana_history(query, context):
-    # Заглушка
     await query.edit_message_text("📜 История покупок для Solana пока недоступна.")
 
-# Вспомогательные функции
 async def _send_long_message(bot, chat_id, text, parse_mode="HTML"):
     if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
         await bot.send_message(chat_id, text, parse_mode=parse_mode, disable_web_page_preview=True)
@@ -278,7 +274,6 @@ async def _send_long_message(bot, chat_id, text, parse_mode="HTML"):
         if chunk:
             await bot.send_message(chat_id, chunk.strip(), parse_mode=parse_mode, disable_web_page_preview=True)
 
-# Обработчики настроек (оставлены как раньше, но можно перенести из предыдущей версии)
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
     user_id = update.effective_user.id
