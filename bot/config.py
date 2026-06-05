@@ -30,6 +30,8 @@ ANKR_API_URL = f"https://rpc.ankr.com/multichain/{ANKR_API_KEY}" if ANKR_API_KEY
 SOLSCAN_API_KEY = os.getenv("SOLSCAN_API_KEY", "")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
+# Birdeye
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
 
 # ---------- Параметры анализа ----------
 DEFAULT_MAX_DEPTH = 3
