@@ -16,7 +16,7 @@ from bot.config import (
 from bot.database import get_all_api_usage, get_user_setting, set_user_setting, get_user_settings_dict
 from bot.graph_traversal import GraphTraversal
 from bot.api_clients import (
-    EVMExplorerClient, AnkrClient, EVMWeb3Client, HeliusClient
+    EVMExplorerClient, AnkrClient, EVMWeb3Client, HeliusClient, CascadePriceFetcher
 )
 from bot.networks.ethereum import EthereumNetwork
 from bot.networks.bsc import BscNetwork
@@ -159,8 +159,9 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = context.user_data['address']
     helius: HeliusClient = context.application.bot_data.get('helius')
-    if not helius:
-        await update.message.reply_text("❌ Helius не настроен.")
+    cascade: CascadePriceFetcher = context.application.bot_data.get('cascade')
+    if not helius or not cascade:
+        await update.message.reply_text("❌ Helius или каскад цен не настроен.")
         return
     try:
         from aiohttp import ClientSession
@@ -174,18 +175,40 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
             lines = [f"💰 <b>Баланс Solana</b>\n<code>{address}</code>\n"
                      f"Общая стоимость: ≈ ${total_usd:,.2f}\n"]
 
+            # Собираем токены без цены
+            no_price_mints = [tok["mint"] for tok in balances if tok.get("usdValue") is None]
+            additional_prices = {}
+            if no_price_mints:
+                additional_prices = await cascade.get_prices(session, no_price_mints)
+
             for tok in balances:
                 symbol = tok.get("symbol") or tok.get("name", "?")
                 bal = float(tok.get("balance", 0))
+                mint = tok.get("mint")
                 usd_val = tok.get("usdValue")
                 if usd_val is not None:
                     usd_val = float(usd_val)
-                    if usd_val < MIN_USD_VALUE:
-                        continue
+                else:
+                    # Пробуем получить из каскада
+                    price = additional_prices.get(mint)
+                    if price is not None:
+                        usd_val = bal * price
+                    else:
+                        usd_val = None
+
+                if usd_val is not None and usd_val < MIN_USD_VALUE:
+                    continue
+
+                if usd_val is not None:
                     price_display = f"≈ ${usd_val:,.2f}"
                 else:
                     price_display = "?"
-                lines.append(f"• {symbol}: {bal:.4f} ({price_display})")
+
+                link = f"https://dexscreener.com/solana/{mint}" if mint else ""
+                if link:
+                    lines.append(f"• <a href='{link}'>{symbol}</a>: {bal:.4f} ({price_display})")
+                else:
+                    lines.append(f"• {symbol}: {bal:.4f} ({price_display})")
 
             text = "\n".join(lines)
             await _send_long_message(context.bot, update.effective_chat.id, text, parse_mode="HTML")
