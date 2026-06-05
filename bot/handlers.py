@@ -171,9 +171,8 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text("❌ Не удалось получить баланс Solana.")
                 return
             balances = data.get("balances", [])
-            total_usd = float(data.get("totalUsdValue", 0))
-            lines = [f"💰 <b>Баланс Solana</b>\n<code>{address}</code>\n"
-                     f"Общая стоимость: ≈ ${total_usd:,.2f}\n"]
+            # Заголовок (без итоговой суммы, добавим позже)
+            lines = [f"💰 <b>Баланс Solana</b>\n<code>{address}</code>"]
 
             # Собираем токены без цены
             no_price_mints = [tok["mint"] for tok in balances if tok.get("usdValue") is None]
@@ -181,6 +180,7 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
             if no_price_mints:
                 additional_prices = await cascade.get_prices(session, no_price_mints)
 
+            total_usd = 0.0
             for tok in balances:
                 symbol = tok.get("symbol") or tok.get("name", "?")
                 bal = float(tok.get("balance", 0))
@@ -189,7 +189,6 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if usd_val is not None:
                     usd_val = float(usd_val)
                 else:
-                    # Пробуем получить из каскада
                     price = additional_prices.get(mint)
                     if price is not None:
                         usd_val = bal * price
@@ -200,6 +199,7 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
                     continue
 
                 if usd_val is not None:
+                    total_usd += usd_val
                     price_display = f"≈ ${usd_val:,.2f}"
                 else:
                     price_display = "?"
@@ -210,6 +210,8 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
                 else:
                     lines.append(f"• {symbol}: {bal:.4f} ({price_display})")
 
+            # Вставляем итоговую сумму перед списком токенов
+            lines.insert(1, f"Общая стоимость: ≈ ${total_usd:,.2f}")
             text = "\n".join(lines)
             await _send_long_message(context.bot, update.effective_chat.id, text, parse_mode="HTML")
 
