@@ -264,12 +264,24 @@ class BirdeyePrice:
         logger.debug(f"Birdeye request for {mint}")
         try:
             async with session.get(self.BASE_URL, params=params, headers=self.headers, timeout=5) as resp:
-                data = await resp.json()
-                logger.debug(f"Birdeye response: {resp.status} {data}")
-                if resp.status == 200 and data.get("success") and data.get("data"):
-                    price = float(data["data"]["value"])
-                    logger.info(f"Birdeye price for {mint}: {price}")
-                    return price
+                if resp.status == 200:
+                    data = await resp.json()
+                    logger.debug(f"Birdeye response: 200 {data}")
+                    if data.get("success") and data.get("data"):
+                        price = float(data["data"]["value"])
+                        logger.info(f"Birdeye price for {mint}: {price}")
+                        return price
+                elif resp.status == 429:
+                    # Повтор через 3 секунды при превышении лимита
+                    logger.warning(f"Birdeye 429 for {mint}, retrying once...")
+                    await asyncio.sleep(3)
+                    async with session.get(self.BASE_URL, params=params, headers=self.headers, timeout=5) as r2:
+                        if r2.status == 200:
+                            data = await r2.json()
+                            if data.get("success") and data.get("data"):
+                                price = float(data["data"]["value"])
+                                logger.info(f"Birdeye retry price for {mint}: {price}")
+                                return price
         except Exception as e:
             logger.warning(f"Birdeye failed for {mint}: {e}")
         return None
@@ -334,6 +346,8 @@ class RPCReservesPrice:
         self.helius = helius
 
     async def get_price(self, session, mint: str) -> Optional[float]:
+        # Упрощённый вариант: находим пул через DexScreener, затем через RPC получаем резервы.
+        # Здесь оставлен как заглушка – может быть реализован позже.
         return None
 
 class CascadePriceFetcher:
@@ -350,7 +364,7 @@ class CascadePriceFetcher:
     async def get_prices(self, session, mints: List[str]) -> Dict[str, float]:
         prices = {}
         logger.info(f"Cascade: getting prices for {len(mints)} tokens: {mints}")
-        # 1. Jupiter
+        # 1. Jupiter (массовый запрос до 100 токенов)
         if mints:
             prices.update(await self.jupiter.get_prices(session, mints))
 
@@ -358,19 +372,19 @@ class CascadePriceFetcher:
         if not remaining:
             return prices
 
-        # 2. Birdeye
+        # 2. Birdeye – с задержкой 2.5 сек (24 запроса/мин, лимит 30)
         if self.birdeye:
             logger.info(f"Trying Birdeye for {len(remaining)} tokens")
             for mint in remaining[:]:
                 price = await self.birdeye.get_price(session, mint)
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(2.5)
                 if price:
                     prices[mint] = price
                     remaining.remove(mint)
         else:
             logger.warning("Birdeye client not available")
 
-        # 3. DexScreener
+        # 3. DexScreener – 0.2 сек (300 запросов/мин)
         for mint in remaining[:]:
             price = await self.dexscr.get_price(session, mint)
             await asyncio.sleep(0.2)
@@ -378,7 +392,7 @@ class CascadePriceFetcher:
                 prices[mint] = price
                 remaining.remove(mint)
 
-        # 4. GeckoTerminal
+        # 4. GeckoTerminal – 0.2 сек (вписывается в 30 запросов/мин, так как токенов мало)
         for mint in remaining[:]:
             price = await self.gecko.get_price(session, mint)
             await asyncio.sleep(0.2)
@@ -386,7 +400,7 @@ class CascadePriceFetcher:
                 prices[mint] = price
                 remaining.remove(mint)
 
-        # 5. DexPaprika
+        # 5. DexPaprika – 0.2 сек (лимит 10k в день, практически не ограничен)
         for mint in remaining[:]:
             price = await self.dexpaprika.get_price(session, mint)
             await asyncio.sleep(0.2)
