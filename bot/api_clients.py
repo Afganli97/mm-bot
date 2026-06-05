@@ -249,6 +249,25 @@ class JupiterMassPrice:
             logger.warning(f"Jupiter mass price failed: {e}")
         return {}
 
+class BirdeyePrice:
+    """Цена через Birdeye (требуется API-ключ)."""
+    BASE_URL = "https://public-api.birdeye.so/defi/price"
+
+    def __init__(self, api_key: str):
+        self.headers = {"X-API-KEY": api_key}
+
+    async def get_price(self, session, mint: str) -> Optional[float]:
+        params = {"address": mint, "x-chain": "solana"}
+        try:
+            async with session.get(self.BASE_URL, params=params, headers=self.headers, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("success") and data.get("data"):
+                        return float(data["data"]["value"])
+        except Exception as e:
+            logger.debug(f"Birdeye failed for {mint}: {e}")
+        return None
+
 class DexScreenerPrice:
     """Цена через DexScreener."""
     BASE_URL = "https://api.dexscreener.com/latest/dex/tokens"
@@ -260,8 +279,12 @@ class DexScreenerPrice:
                 if resp.status == 200:
                     data = await resp.json()
                     pairs = data.get("pairs")
-                    if pairs and pairs[0].get("priceUsd"):
-                        return float(pairs[0]["priceUsd"])
+                    if pairs:
+                        # Берём пару с наибольшей ликвидностью
+                        best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+                        price = best.get("priceUsd")
+                        if price:
+                            return float(price)
         except Exception as e:
             logger.debug(f"DexScreener failed for {mint}: {e}")
         return None
@@ -281,25 +304,6 @@ class GeckoTerminalPrice:
                         return float(price)
         except Exception as e:
             logger.debug(f"GeckoTerminal failed for {mint}: {e}")
-        return None
-
-class BirdeyePrice:
-    """Цена через Birdeye (требуется API-ключ)."""
-    BASE_URL = "https://public-api.birdeye.so/defi/price"
-
-    def __init__(self, api_key: str):
-        self.headers = {"X-API-KEY": api_key}
-
-    async def get_price(self, session, mint: str) -> Optional[float]:
-        params = {"address": mint, "x-chain": "solana"}
-        try:
-            async with session.get(self.BASE_URL, params=params, headers=self.headers, timeout=5) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("success") and data.get("data"):
-                        return float(data["data"]["value"])
-        except Exception as e:
-            logger.debug(f"Birdeye failed for {mint}: {e}")
         return None
 
 class DexPaprikaPrice:
@@ -331,15 +335,15 @@ class CascadePriceFetcher:
     """Каскадный определитель цены для Solana токенов."""
     def __init__(self, helius: HeliusClient):
         self.jupiter = JupiterMassPrice()
+        self.birdeye = BirdeyePrice(BIRDEYE_API_KEY) if BIRDEYE_API_KEY else None
         self.dexscr = DexScreenerPrice()
         self.gecko = GeckoTerminalPrice()
-        self.birdeye = BirdeyePrice(BIRDEYE_API_KEY) if BIRDEYE_API_KEY else None
         self.dexpaprika = DexPaprikaPrice()
-        self.rpc_reserves = RPCReservesPrice(helius)
+        # self.rpc_reserves = RPCReservesPrice(helius)  # пока не используется
 
     async def get_prices(self, session, mints: List[str]) -> Dict[str, float]:
         prices = {}
-        # 1. Jupiter массовый
+        # 1. Jupiter (массовый запрос до 100 токенов)
         if mints:
             prices.update(await self.jupiter.get_prices(session, mints))
 
@@ -348,32 +352,43 @@ class CascadePriceFetcher:
         if not remaining:
             return prices
 
-        # 2-6 по одному
-        for mint in remaining:
-            price = None
-            # DexScreener
-            if not price:
-                price = await self.dexscr.get_price(session, mint)
-                await asyncio.sleep(0.2)
-            # GeckoTerminal
-            if not price:
-                price = await self.gecko.get_price(session, mint)
-                await asyncio.sleep(0.2)
-            # Birdeye
-            if not price and self.birdeye:
+        # 2. Birdeye (если есть ключ) – наиболее точный агрегатор
+        if self.birdeye:
+            for mint in remaining[:]:
                 price = await self.birdeye.get_price(session, mint)
                 await asyncio.sleep(0.2)
-            # DexPaprika
-            if not price:
-                price = await self.dexpaprika.get_price(session, mint)
-                await asyncio.sleep(0.2)
-            # RPC резервы (заглушка)
-            if not price:
-                price = await self.rpc_reserves.get_price(session, mint)
-                await asyncio.sleep(0.2)
+                if price:
+                    prices[mint] = price
+                    remaining.remove(mint)
 
+        # 3. DexScreener (теперь выбираем пару с наибольшей ликвидностью)
+        for mint in remaining[:]:
+            price = await self.dexscr.get_price(session, mint)
+            await asyncio.sleep(0.2)
             if price:
                 prices[mint] = price
+                remaining.remove(mint)
+
+        # 4. GeckoTerminal
+        for mint in remaining[:]:
+            price = await self.gecko.get_price(session, mint)
+            await asyncio.sleep(0.2)
+            if price:
+                prices[mint] = price
+                remaining.remove(mint)
+
+        # 5. DexPaprika
+        for mint in remaining[:]:
+            price = await self.dexpaprika.get_price(session, mint)
+            await asyncio.sleep(0.2)
+            if price:
+                prices[mint] = price
+                remaining.remove(mint)
+
+        # 6. RPC‑резервы (заглушка) – не используется
+        # for mint in remaining:
+        #     price = await self.rpc_reserves.get_price(session, mint)
+        #     ...
 
         return prices
 
