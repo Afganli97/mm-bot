@@ -8,7 +8,7 @@ from telegram.ext import ApplicationBuilder
 from bot.config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, LOG_FILE, ETHERSCAN_API_KEYS, ANKR_API_URL, HELIUS_API_KEY
 from bot.database import init_db
 from bot.handlers import register_handlers
-from bot.api_clients import AnkrClient, HeliusClient
+from bot.api_clients import AnkrClient, HeliusClient, CascadePriceFetcher
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
@@ -23,7 +23,9 @@ async def post_init(app):
     app.bot_data['session'] = session
     app.bot_data['ankr'] = AnkrClient(ANKR_API_URL)
     if HELIUS_API_KEY:
-        app.bot_data['helius'] = HeliusClient(HELIUS_API_KEY)
+        helius = HeliusClient(HELIUS_API_KEY)
+        app.bot_data['helius'] = helius
+        app.bot_data['cascade'] = CascadePriceFetcher(helius)
     else:
         logger.warning("Helius API ключ не задан, балансы Solana не будут работать")
     app.bot_data['etherscan_keys'] = ETHERSCAN_API_KEYS
