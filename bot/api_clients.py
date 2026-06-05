@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from bot.config import (
     ETHERSCAN_API_KEYS, ANKR_API_URL,
-    HELIUS_API_KEY, HELIUS_URL
+    HELIUS_API_KEY, HELIUS_URL, BIRDEYE_API_KEY
 )
 from bot.database import increment_api_usage, get_api_usage_today
 
@@ -215,6 +215,168 @@ class HeliusClient:
                 logger.error(f"Helius getTransaction HTTP {resp.status}")
         return {}
 
+    async def get_token_reserves(self, session, pool_address: str) -> Optional[tuple]:
+        """Возвращает резервы (reserve0, reserve1) для пула Raydium/Orca. Упрощённо: получаем аккаунт пула."""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [pool_address, {"encoding": "jsonParsed"}]
+        }
+        async with session.post(f"{self.RPC_URL}/?api-key={self.api_key}", json=payload, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                info = data.get("result", {}).get("value", {})
+                # Здесь нужен парсинг структуры пула, но для примера возвращаем None
+                return None
+        return None
+
+class JupiterMassPrice:
+    """Получение цен через Jupiter (один запрос для многих токенов)."""
+    BASE_URL = "https://price.jup.ag/v4/price"
+
+    async def get_prices(self, session, mint_addresses: List[str]) -> Dict[str, float]:
+        if not mint_addresses:
+            return {}
+        ids = ",".join(mint_addresses[:100])  # до 100 за раз
+        url = f"{self.BASE_URL}?ids={ids}"
+        try:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {mint: float(info["price"]) for mint, info in data.get("data", {}).items()}
+        except Exception as e:
+            logger.warning(f"Jupiter mass price failed: {e}")
+        return {}
+
+class DexScreenerPrice:
+    """Цена через DexScreener."""
+    BASE_URL = "https://api.dexscreener.com/latest/dex/tokens"
+
+    async def get_price(self, session, mint: str) -> Optional[float]:
+        url = f"{self.BASE_URL}/{mint}"
+        try:
+            async with session.get(url, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs")
+                    if pairs and pairs[0].get("priceUsd"):
+                        return float(pairs[0]["priceUsd"])
+        except Exception as e:
+            logger.debug(f"DexScreener failed for {mint}: {e}")
+        return None
+
+class GeckoTerminalPrice:
+    """Цена через GeckoTerminal."""
+    BASE_URL = "https://api.geckoterminal.com/api/v1/networks/solana/tokens"
+
+    async def get_price(self, session, mint: str) -> Optional[float]:
+        url = f"{self.BASE_URL}/{mint}"
+        try:
+            async with session.get(url, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    price = data.get("data", {}).get("attributes", {}).get("price_usd")
+                    if price:
+                        return float(price)
+        except Exception as e:
+            logger.debug(f"GeckoTerminal failed for {mint}: {e}")
+        return None
+
+class BirdeyePrice:
+    """Цена через Birdeye (требуется API-ключ)."""
+    BASE_URL = "https://public-api.birdeye.so/defi/price"
+
+    def __init__(self, api_key: str):
+        self.headers = {"X-API-KEY": api_key}
+
+    async def get_price(self, session, mint: str) -> Optional[float]:
+        params = {"address": mint, "x-chain": "solana"}
+        try:
+            async with session.get(self.BASE_URL, params=params, headers=self.headers, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("success") and data.get("data"):
+                        return float(data["data"]["value"])
+        except Exception as e:
+            logger.debug(f"Birdeye failed for {mint}: {e}")
+        return None
+
+class DexPaprikaPrice:
+    """Цена через DexPaprika (без ключа)."""
+    BASE_URL = "https://api.dexpaprika.com/v1/tokens"
+
+    async def get_price(self, session, mint: str) -> Optional[float]:
+        url = f"{self.BASE_URL}/{mint}/price"
+        try:
+            async with session.get(url, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return float(data.get("price", 0))
+        except Exception as e:
+            logger.debug(f"DexPaprika failed for {mint}: {e}")
+        return None
+
+class RPCReservesPrice:
+    """Расчёт цены через резервы пула (через Helius RPC)."""
+    def __init__(self, helius: HeliusClient):
+        self.helius = helius
+
+    async def get_price(self, session, mint: str) -> Optional[float]:
+        # Упрощённый вариант: находим пул через DexScreener, затем через RPC получаем резервы.
+        # Здесь оставлен как заглушка – может быть реализован позже.
+        return None
+
+class CascadePriceFetcher:
+    """Каскадный определитель цены для Solana токенов."""
+    def __init__(self, helius: HeliusClient):
+        self.jupiter = JupiterMassPrice()
+        self.dexscr = DexScreenerPrice()
+        self.gecko = GeckoTerminalPrice()
+        self.birdeye = BirdeyePrice(BIRDEYE_API_KEY) if BIRDEYE_API_KEY else None
+        self.dexpaprika = DexPaprikaPrice()
+        self.rpc_reserves = RPCReservesPrice(helius)
+
+    async def get_prices(self, session, mints: List[str]) -> Dict[str, float]:
+        prices = {}
+        # 1. Jupiter массовый
+        if mints:
+            prices.update(await self.jupiter.get_prices(session, mints))
+
+        # Оставшиеся без цены
+        remaining = [m for m in mints if m not in prices]
+        if not remaining:
+            return prices
+
+        # 2-6 по одному
+        for mint in remaining:
+            price = None
+            # DexScreener
+            if not price:
+                price = await self.dexscr.get_price(session, mint)
+                await asyncio.sleep(0.2)
+            # GeckoTerminal
+            if not price:
+                price = await self.gecko.get_price(session, mint)
+                await asyncio.sleep(0.2)
+            # Birdeye
+            if not price and self.birdeye:
+                price = await self.birdeye.get_price(session, mint)
+                await asyncio.sleep(0.2)
+            # DexPaprika
+            if not price:
+                price = await self.dexpaprika.get_price(session, mint)
+                await asyncio.sleep(0.2)
+            # RPC резервы (заглушка)
+            if not price:
+                price = await self.rpc_reserves.get_price(session, mint)
+                await asyncio.sleep(0.2)
+
+            if price:
+                prices[mint] = price
+
+        return prices
+
 class EVMWeb3Client:
     def __init__(self, rpc_url, chain_id, weth, router=None, stable=None):
         self.rpc_url = rpc_url
@@ -245,14 +407,6 @@ class EVMWeb3Client:
         if result and result != "0x":
             return int(result, 16)
         return 0
-
-class CascadePriceFetcher:
-    def __init__(self):
-        self._semaphore = asyncio.Semaphore(10)
-
-    async def get_price(self, session, chain, token_address, web3_client=None, weth_price=0.0):
-        # не используется для Solana, оставлен для будущих EVM нужд
-        return None
 
 class TokenInfoService:
     @staticmethod
