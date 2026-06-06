@@ -35,7 +35,6 @@ class SolanaTraversal:
             addr, depth = queue.popleft()
             logger.debug(f"Обработка Solana адреса {addr} (глубина {depth})")
 
-            # Увеличили лимит до 100 транзакций
             signatures = await self.helius.get_signatures_for_address(self.session, addr, limit=100)
             for sig_info in signatures:
                 if len(self.unique_tokens) >= self.max_tokens:
@@ -51,7 +50,6 @@ class SolanaTraversal:
                 if meta.get("err"):
                     continue
 
-                # Анализируем изменение балансов токенов именно для этого адреса
                 pre = {item["mint"]: float(item.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
                        for item in meta.get("preTokenBalances", [])
                        if item.get("owner") == addr and item.get("mint") != "So11111111111111111111111111111111111111111"}
@@ -67,14 +65,13 @@ class SolanaTraversal:
                         if mint not in self.unique_tokens:
                             self.found_tokens.append({
                                 'token': mint,
-                                'symbol': '?',   # будет заполнено позже
+                                'symbol': '?',
                                 'buyer': addr,
                                 'tx': sig
                             })
                             self.unique_tokens.add(mint)
                             logger.info(f"Solana покупка: {mint} у {addr}")
 
-                # Собираем получателей SOL/токенов для продолжения обхода
                 if depth + 1 < self.max_depth:
                     for instr in tx_data.get("transaction", {}).get("message", {}).get("instructions", []):
                         if not isinstance(instr, dict):
