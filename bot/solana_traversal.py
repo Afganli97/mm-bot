@@ -77,6 +77,8 @@ class SolanaTraversal:
                 # Собираем получателей SOL/токенов для продолжения обхода
                 if depth + 1 < self.max_depth:
                     for instr in tx_data.get("transaction", {}).get("message", {}).get("instructions", []):
+                        if not isinstance(instr, dict):
+                            continue
                         if instr.get("parsed", {}).get("type") == "transfer":
                             dest = instr["parsed"]["info"].get("destination")
                             if dest and dest not in self.visited and dest != addr:
