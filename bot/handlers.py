@@ -290,7 +290,7 @@ async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
         async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                if isinstance(data, dict) and "data" in data:
+                if isinstance(data, dict) and "data" in data and isinstance(data["data"], dict):
                     for mint, info in data["data"].items():
                         if isinstance(info, dict):
                             name = info.get("name") or info.get("symbol") or "?"
@@ -310,13 +310,12 @@ async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
                 async with session.get(url, headers={"X-API-KEY": BIRDEYE_API_KEY}, timeout=5) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        if isinstance(data, dict) and "data" in data:
+                        if isinstance(data, dict) and "data" in data and isinstance(data["data"], dict):
                             token_data = data["data"]
-                            if isinstance(token_data, dict):
-                                name = token_data.get("name") or token_data.get("symbol")
-                                if name:
-                                    names[mint] = name
-                                    remaining.remove(mint)
+                            name = token_data.get("name") or token_data.get("symbol")
+                            if name:
+                                names[mint] = name
+                                remaining.remove(mint)
             except:
                 pass
             await asyncio.sleep(0.3)
@@ -362,7 +361,11 @@ async def run_solana_history(query, context):
                 return
 
             unique_mints = list({item['token'] for item in found})
-            names = await get_token_names_cascade(session, unique_mints)
+            try:
+                names = await get_token_names_cascade(session, unique_mints)
+            except Exception as e:
+                logger.warning(f"Не удалось получить имена токенов: {e}")
+                names = {}
 
             token_lines = []
             for item in found:
