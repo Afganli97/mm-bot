@@ -215,22 +215,6 @@ class HeliusClient:
                 logger.error(f"Helius getTransaction HTTP {resp.status}")
         return {}
 
-    async def get_token_reserves(self, session, pool_address: str) -> Optional[tuple]:
-        """Возвращает резервы (reserve0, reserve1) для пула Raydium/Orca. Упрощённо: получаем аккаунт пула."""
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getAccountInfo",
-            "params": [pool_address, {"encoding": "jsonParsed"}]
-        }
-        async with session.post(f"{self.RPC_URL}/?api-key={self.api_key}", json=payload, timeout=10) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                info = data.get("result", {}).get("value", {})
-                # Здесь нужен парсинг структуры пула, но для примера возвращаем None
-                return None
-        return None
-
 class JupiterMassPrice:
     """Получение цен через Jupiter (один запрос для многих токенов)."""
     BASE_URL = "https://price.jup.ag/v4/price"
@@ -238,13 +222,13 @@ class JupiterMassPrice:
     async def get_prices(self, session, mint_addresses: List[str]) -> Dict[str, float]:
         if not mint_addresses:
             return {}
-        ids = ",".join(mint_addresses[:100])  # до 100 за раз
+        ids = ",".join(mint_addresses[:100])
         url = f"{self.BASE_URL}?ids={ids}"
         try:
             async with session.get(url, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    prices = {mint: float(info["price"]) for mint, info in data.get("data", {}).items()}
+                    prices = {mint: float(info["price"]) for mint, info in data.get("data", {}).items() if "price" in info}
                     logger.debug(f"Jupiter prices: {prices}")
                     return prices
         except Exception as e:
@@ -272,7 +256,6 @@ class BirdeyePrice:
                         logger.info(f"Birdeye price for {mint}: {price}")
                         return price
                 elif resp.status == 429:
-                    # Повтор через 3 секунды при превышении лимита
                     logger.warning(f"Birdeye 429 for {mint}, retrying once...")
                     await asyncio.sleep(3)
                     async with session.get(self.BASE_URL, params=params, headers=self.headers, timeout=5) as r2:
@@ -340,16 +323,6 @@ class DexPaprikaPrice:
             logger.debug(f"DexPaprika failed for {mint}: {e}")
         return None
 
-class RPCReservesPrice:
-    """Расчёт цены через резервы пула (через Helius RPC)."""
-    def __init__(self, helius: HeliusClient):
-        self.helius = helius
-
-    async def get_price(self, session, mint: str) -> Optional[float]:
-        # Упрощённый вариант: находим пул через DexScreener, затем через RPC получаем резервы.
-        # Здесь оставлен как заглушка – может быть реализован позже.
-        return None
-
 class CascadePriceFetcher:
     """Каскадный определитель цены для Solana токенов."""
     def __init__(self, helius: HeliusClient):
@@ -392,7 +365,7 @@ class CascadePriceFetcher:
                 prices[mint] = price
                 remaining.remove(mint)
 
-        # 4. GeckoTerminal – 0.2 сек (вписывается в 30 запросов/мин, так как токенов мало)
+        # 4. GeckoTerminal – 0.2 сек
         for mint in remaining[:]:
             price = await self.gecko.get_price(session, mint)
             await asyncio.sleep(0.2)
@@ -400,7 +373,7 @@ class CascadePriceFetcher:
                 prices[mint] = price
                 remaining.remove(mint)
 
-        # 5. DexPaprika – 0.2 сек (лимит 10k в день, практически не ограничен)
+        # 5. DexPaprika – 0.2 сек
         for mint in remaining[:]:
             price = await self.dexpaprika.get_price(session, mint)
             await asyncio.sleep(0.2)
