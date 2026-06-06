@@ -4,7 +4,7 @@
 import logging
 import asyncio
 from datetime import datetime, date, timedelta
-from typing import Optional
+from typing import Optional, Dict, List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 
@@ -16,7 +16,8 @@ from bot.config import (
 from bot.database import get_all_api_usage, get_user_setting, set_user_setting, get_user_settings_dict
 from bot.graph_traversal import GraphTraversal
 from bot.api_clients import (
-    EVMExplorerClient, AnkrClient, EVMWeb3Client, HeliusClient, CascadePriceFetcher, JupiterMassPrice
+    EVMExplorerClient, AnkrClient, EVMWeb3Client, HeliusClient, CascadePriceFetcher,
+    JupiterMassPrice, BirdeyePrice, DexScreenerPrice
 )
 from bot.networks.ethereum import EthereumNetwork
 from bot.networks.bsc import BscNetwork
@@ -171,10 +172,8 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text("❌ Не удалось получить баланс Solana.")
                 return
             balances = data.get("balances", [])
-            # Заголовок (без итоговой суммы, добавим позже)
             lines = [f"💰 <b>Баланс Solana</b>\n<code>{address}</code>"]
 
-            # Собираем токены без цены
             no_price_mints = [tok["mint"] for tok in balances if tok.get("usdValue") is None]
             additional_prices = {}
             if no_price_mints:
@@ -210,7 +209,6 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
                 else:
                     lines.append(f"• {symbol}: {bal:.4f} ({price_display})")
 
-            # Вставляем итоговую сумму перед списком токенов
             lines.insert(1, f"Общая стоимость: ≈ ${total_usd:,.2f}")
             text = "\n".join(lines)
             await _send_long_message(context.bot, update.effective_chat.id, text, parse_mode="HTML")
@@ -279,6 +277,76 @@ async def run_evm_history(query, context, chain: str):
         logger.exception("Ошибка истории EVM")
         await query.edit_message_text(f"❌ Ошибка: {e}")
 
+async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
+    """
+    Каскадное получение имён токенов Solana.
+    Порядок: Jupiter (массовый) → Birdeye (по одному) → DexScreener → сокращённый адрес.
+    Возвращает словарь {mint: name}.
+    """
+    names = {}
+    if not mints:
+        return names
+
+    # 1. Jupiter (массовый запрос)
+    try:
+        ids = ",".join(mints[:100])
+        url = f"https://price.jup.ag/v4/price?ids={ids}"
+        async with session.get(url, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                for mint, info in data.get("data", {}).items():
+                    name = info.get("name") or info.get("symbol") or "?"
+                    names[mint] = name
+    except Exception as e:
+        logger.warning(f"Jupiter имена недоступны: {e}")
+
+    # Оставшиеся без имени
+    remaining = [m for m in mints if m not in names]
+    if not remaining:
+        return names
+
+    # 2. Birdeye (по одному)
+    birdeye = BirdeyePrice.__new__(BirdeyePrice) if BIRDEYE_API_KEY else None  # используем ключ из config
+    if birdeye:
+        for mint in remaining[:]:
+            try:
+                async with session.get(
+                    f"https://public-api.birdeye.so/defi/token_overview?address={mint}&x-chain=solana",
+                    headers={"X-API-KEY": BIRDEYE_API_KEY},
+                    timeout=5
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        name = data.get("data", {}).get("name") or data.get("data", {}).get("symbol")
+                        if name:
+                            names[mint] = name
+                            remaining.remove(mint)
+            except:
+                pass
+            await asyncio.sleep(0.2)
+
+    # 3. DexScreener
+    for mint in remaining[:]:
+        try:
+            async with session.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs")
+                    if pairs:
+                        name = pairs[0].get("baseToken", {}).get("name") or pairs[0].get("baseToken", {}).get("symbol")
+                        if name:
+                            names[mint] = name
+                            remaining.remove(mint)
+        except:
+            pass
+        await asyncio.sleep(0.2)
+
+    # 4. Сокращённый адрес для оставшихся
+    for mint in remaining:
+        names[mint] = f"{mint[:6]}...{mint[-4:]}"
+
+    return names
+
 async def run_solana_history(query, context):
     address = context.user_data['address']
     helius: HeliusClient = context.application.bot_data.get('helius')
@@ -294,21 +362,9 @@ async def run_solana_history(query, context):
                 await query.edit_message_text("✅ Анализ завершён. Токены не найдены.")
                 return
 
-            # Получаем имена токенов через Jupiter (один запрос)
+            # Получаем имена через каскад
             unique_mints = list({item['token'] for item in found})
-            jupiter = JupiterMassPrice()
-            # Jupiter возвращает {mint: {price, name}}, но нам нужны только имена
-            names = {}
-            if unique_mints:
-                # Используем тот же метод get_prices, но он возвращает только цены. Поэтому запросим напрямую.
-                ids = ",".join(unique_mints[:100])
-                url = f"https://price.jup.ag/v4/price?ids={ids}"
-                async with session.get(url, timeout=10) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        for mint, info in data.get("data", {}).items():
-                            name = info.get("name") or info.get("symbol") or "?"
-                            names[mint] = name
+            names = await get_token_names_cascade(session, unique_mints)
 
             token_lines = []
             for item in found:
@@ -319,7 +375,6 @@ async def run_solana_history(query, context):
 
             report = f"✅ <b>История покупок Solana</b>\nНайдено токенов: {len(found)}\n" + "\n".join(token_lines)
             await _send_long_message(context.bot, query.message.chat_id, report, parse_mode="HTML")
-            # Не отправляем отдельное "Готово"
     except Exception as e:
         logger.exception("Ошибка истории Solana")
         await query.edit_message_text(f"❌ Ошибка: {e}")
