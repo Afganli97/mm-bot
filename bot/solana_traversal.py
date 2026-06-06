@@ -35,8 +35,8 @@ class SolanaTraversal:
             addr, depth = queue.popleft()
             logger.debug(f"Обработка Solana адреса {addr} (глубина {depth})")
 
-            # Получаем транзакции адреса
-            signatures = await self.helius.get_signatures_for_address(self.session, addr, limit=50)
+            # Увеличили лимит до 100 транзакций
+            signatures = await self.helius.get_signatures_for_address(self.session, addr, limit=100)
             for sig_info in signatures:
                 if len(self.unique_tokens) >= self.max_tokens:
                     break
@@ -62,29 +62,37 @@ class SolanaTraversal:
                 for mint, post_amt in post.items():
                     pre_amt = pre.get(mint, 0.0)
                     if post_amt > pre_amt:
-                        # Это покупка
                         if is_excluded(mint):
                             continue
                         if mint not in self.unique_tokens:
-                            # Пытаемся получить символ из postTokenBalances
-                            symbol = "?"
-                            for b in meta.get("postTokenBalances", []):
-                                if b.get("mint") == mint and b.get("owner") == addr:
-                                    symbol = b.get("symbol", "?")
-                                    break
                             self.found_tokens.append({
                                 'token': mint,
-                                'symbol': symbol,
+                                'symbol': '?',   # будет заполнено позже
                                 'buyer': addr,
                                 'tx': sig
                             })
                             self.unique_tokens.add(mint)
-                            logger.info(f"Solana покупка: {mint} ({symbol}) у {addr}")
+                            logger.info(f"Solana покупка: {mint} у {addr}")
 
-            # Углубляемся только для следующих адресов (получателей SOL/токенов), но в этой версии опускаем для простоты
-            if depth + 1 < self.max_depth:
-                # Не добавляем новые адреса – оставляем только первый уровень
-                pass
+                # Собираем получателей SOL/токенов для продолжения обхода
+                if depth + 1 < self.max_depth:
+                    for instr in tx_data.get("transaction", {}).get("message", {}).get("instructions", []):
+                        if instr.get("parsed", {}).get("type") == "transfer":
+                            dest = instr["parsed"]["info"].get("destination")
+                            if dest and dest not in self.visited and dest != addr:
+                                self.visited.add(dest)
+                                queue.append((dest, depth + 1))
+                                self.total_addresses += 1
+                                if self.total_addresses >= 2000:
+                                    break
+                        elif instr.get("parsed", {}).get("type") == "transferChecked":
+                            dest = instr["parsed"]["info"].get("destination")
+                            if dest and dest not in self.visited and dest != addr:
+                                self.visited.add(dest)
+                                queue.append((dest, depth + 1))
+                                self.total_addresses += 1
+                                if self.total_addresses >= 2000:
+                                    break
 
         logger.info(f"Solana обход завершён. Адресов: {self.total_addresses}, токенов: {len(self.found_tokens)}")
         return self.found_tokens
