@@ -173,11 +173,11 @@ class HeliusClient:
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self._semaphore = asyncio.Semaphore(5)  # не более 5 одновременных запросов
+        self._semaphore = asyncio.Semaphore(5)
 
     async def _do_request(self, session, method: str, params: list) -> Any:
         async with self._semaphore:
-            await asyncio.sleep(0.35)  # лимит 10 RPS
+            await asyncio.sleep(0.35)
             payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
             async with session.post(f"{self.RPC_URL}/?api-key={self.api_key}", json=payload, timeout=10) as resp:
                 if resp.status == 200:
@@ -197,74 +197,51 @@ class HeliusClient:
                 return {}
 
     async def get_signatures_for_address(self, session, address: str, limit: int = 100) -> List[Dict]:
-        return await self._do_request(session, "getSignaturesForAddress",
-                                      [address, {"limit": limit}]) or []
+        return await self._do_request(session, "getSignaturesForAddress", [address, {"limit": limit}]) or []
 
     async def get_transaction(self, session, signature: str) -> Dict:
-        return await self._do_request(session, "getTransaction",
-                                      [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]) or {}
+        return await self._do_request(session, "getTransaction", [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]) or {}
 
 class JupiterMassPrice:
-    """Получение цен через Jupiter (один запрос для многих токенов)."""
     BASE_URL = "https://price.jup.ag/v4/price"
-
     async def get_prices(self, session, mint_addresses: List[str]) -> Dict[str, float]:
-        if not mint_addresses:
-            return {}
+        if not mint_addresses: return {}
         ids = ",".join(mint_addresses[:100])
         url = f"{self.BASE_URL}?ids={ids}"
         try:
             async with session.get(url, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    prices = {mint: float(info["price"]) for mint, info in data.get("data", {}).items() if "price" in info}
-                    logger.debug(f"Jupiter prices: {prices}")
+                    prices = {}
+                    if isinstance(data, dict) and "data" in data and isinstance(data["data"], dict):
+                        for mint, info in data["data"].items():
+                            if isinstance(info, dict) and "price" in info:
+                                prices[mint] = float(info["price"])
                     return prices
         except Exception as e:
             logger.warning(f"Jupiter mass price failed: {e}")
         return {}
 
 class BirdeyePrice:
-    """Цена через Birdeye (требуется API-ключ)."""
     BASE_URL = "https://public-api.birdeye.so/defi/price"
-
     def __init__(self, api_key: str):
         self.headers = {"X-API-KEY": api_key}
-        logger.info(f"BirdeyePrice initialized with key: {api_key[:8]}...")
-
     async def get_price(self, session, mint: str) -> Optional[float]:
         params = {"address": mint, "x-chain": "solana"}
-        logger.debug(f"Birdeye request for {mint}")
         try:
             async with session.get(self.BASE_URL, params=params, headers=self.headers, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    logger.debug(f"Birdeye response: 200 {data}")
-                    if data.get("success") and data.get("data"):
-                        price = float(data["data"]["value"])
-                        logger.info(f"Birdeye price for {mint}: {price}")
-                        return price
-                elif resp.status == 429:
-                    logger.warning(f"Birdeye 429 for {mint}, retrying once...")
-                    await asyncio.sleep(3)
-                    async with session.get(self.BASE_URL, params=params, headers=self.headers, timeout=5) as r2:
-                        if r2.status == 200:
-                            data = await r2.json()
-                            if data.get("success") and data.get("data"):
-                                price = float(data["data"]["value"])
-                                logger.info(f"Birdeye retry price for {mint}: {price}")
-                                return price
+                    if isinstance(data, dict) and data.get("success") and isinstance(data.get("data"), dict):
+                        return float(data["data"]["value"])
         except Exception as e:
             logger.warning(f"Birdeye failed for {mint}: {e}")
         return None
 
 class DexScreenerPrice:
-    """Цена через DexScreener."""
     BASE_URL = "https://api.dexscreener.com/latest/dex/tokens"
-
     async def get_price(self, session, mint: str) -> Optional[float]:
         url = f"{self.BASE_URL}/{mint}"
-        logger.debug(f"DexScreener request for {mint}")
         try:
             async with session.get(url, timeout=5) as resp:
                 if resp.status == 200:
@@ -274,16 +251,13 @@ class DexScreenerPrice:
                         best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
                         price = best.get("priceUsd")
                         if price:
-                            logger.info(f"DexScreener price for {mint}: {price}")
                             return float(price)
         except Exception as e:
             logger.warning(f"DexScreener failed for {mint}: {e}")
         return None
 
 class GeckoTerminalPrice:
-    """Цена через GeckoTerminal."""
     BASE_URL = "https://api.geckoterminal.com/api/v1/networks/solana/tokens"
-
     async def get_price(self, session, mint: str) -> Optional[float]:
         url = f"{self.BASE_URL}/{mint}"
         try:
@@ -291,16 +265,12 @@ class GeckoTerminalPrice:
                 if resp.status == 200:
                     data = await resp.json()
                     price = data.get("data", {}).get("attributes", {}).get("price_usd")
-                    if price:
-                        return float(price)
-        except Exception as e:
-            logger.debug(f"GeckoTerminal failed for {mint}: {e}")
+                    if price: return float(price)
+        except: pass
         return None
 
 class DexPaprikaPrice:
-    """Цена через DexPaprika (без ключа)."""
     BASE_URL = "https://api.dexpaprika.com/v1/tokens"
-
     async def get_price(self, session, mint: str) -> Optional[float]:
         url = f"{self.BASE_URL}/{mint}/price"
         try:
@@ -308,69 +278,43 @@ class DexPaprikaPrice:
                 if resp.status == 200:
                     data = await resp.json()
                     return float(data.get("price", 0))
-        except Exception as e:
-            logger.debug(f"DexPaprika failed for {mint}: {e}")
+        except: pass
         return None
 
 class CascadePriceFetcher:
-    """Каскадный определитель цены для Solana токенов."""
     def __init__(self, helius: HeliusClient):
         self.jupiter = JupiterMassPrice()
         self.birdeye = BirdeyePrice(BIRDEYE_API_KEY) if BIRDEYE_API_KEY else None
         self.dexscr = DexScreenerPrice()
         self.gecko = GeckoTerminalPrice()
         self.dexpaprika = DexPaprikaPrice()
-        if not BIRDEYE_API_KEY:
-            logger.warning("BIRDEYE_API_KEY is empty, Birdeye step will be skipped")
 
     async def get_prices(self, session, mints: List[str]) -> Dict[str, float]:
         prices = {}
-        logger.info(f"Cascade: getting prices for {len(mints)} tokens: {mints}")
-        # 1. Jupiter (массовый запрос до 100 токенов)
         if mints:
             prices.update(await self.jupiter.get_prices(session, mints))
-
         remaining = [m for m in mints if m not in prices]
-        if not remaining:
-            return prices
-
-        # 2. Birdeye – с задержкой 2.5 сек (24 запроса/мин, лимит 30)
         if self.birdeye:
-            logger.info(f"Trying Birdeye for {len(remaining)} tokens")
             for mint in remaining[:]:
                 price = await self.birdeye.get_price(session, mint)
                 await asyncio.sleep(2.5)
                 if price:
                     prices[mint] = price
                     remaining.remove(mint)
-        else:
-            logger.warning("Birdeye client not available")
-
-        # 3. DexScreener – 0.2 сек (300 запросов/мин)
         for mint in remaining[:]:
             price = await self.dexscr.get_price(session, mint)
             await asyncio.sleep(0.2)
             if price:
                 prices[mint] = price
                 remaining.remove(mint)
-
-        # 4. GeckoTerminal – 0.2 сек
         for mint in remaining[:]:
             price = await self.gecko.get_price(session, mint)
             await asyncio.sleep(0.2)
-            if price:
-                prices[mint] = price
-                remaining.remove(mint)
-
-        # 5. DexPaprika – 0.2 сек
+            if price: prices[mint] = price
         for mint in remaining[:]:
             price = await self.dexpaprika.get_price(session, mint)
             await asyncio.sleep(0.2)
-            if price:
-                prices[mint] = price
-                remaining.remove(mint)
-
-        logger.info(f"Cascade result: {prices}")
+            if price: prices[mint] = price
         return prices
 
 class EVMWeb3Client:
