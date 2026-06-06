@@ -173,6 +173,19 @@ class HeliusClient:
 
     def __init__(self, api_key: str):
         self.api_key = api_key
+        self._semaphore = asyncio.Semaphore(5)  # не более 5 одновременных запросов
+
+    async def _do_request(self, session, method: str, params: list) -> Any:
+        async with self._semaphore:
+            await asyncio.sleep(0.35)  # лимит 10 RPS
+            payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+            async with session.post(f"{self.RPC_URL}/?api-key={self.api_key}", json=payload, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("result")
+                else:
+                    logger.error(f"Helius {method} HTTP {resp.status}")
+                    return None
 
     async def get_wallet_balances(self, session, address: str) -> Dict:
         url = f"{self.BASE_URL}/wallet/{address}/balances?api-key={self.api_key}"
@@ -184,36 +197,12 @@ class HeliusClient:
                 return {}
 
     async def get_signatures_for_address(self, session, address: str, limit: int = 100) -> List[Dict]:
-        """Возвращает список транзакций адреса (подписи)."""
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getSignaturesForAddress",
-            "params": [address, {"limit": limit}]
-        }
-        async with session.post(f"{self.RPC_URL}/?api-key={self.api_key}", json=payload, timeout=10) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("result", [])
-            else:
-                logger.error(f"Helius getSignatures HTTP {resp.status}")
-        return []
+        return await self._do_request(session, "getSignaturesForAddress",
+                                      [address, {"limit": limit}]) or []
 
     async def get_transaction(self, session, signature: str) -> Dict:
-        """Получает детали транзакции по подписи."""
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTransaction",
-            "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
-        }
-        async with session.post(f"{self.RPC_URL}/?api-key={self.api_key}", json=payload, timeout=10) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("result", {})
-            else:
-                logger.error(f"Helius getTransaction HTTP {resp.status}")
-        return {}
+        return await self._do_request(session, "getTransaction",
+                                      [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]) or {}
 
 class JupiterMassPrice:
     """Получение цен через Jupiter (один запрос для многих токенов)."""
