@@ -16,7 +16,7 @@ from bot.config import (
 from bot.database import get_all_api_usage, get_user_setting, set_user_setting, get_user_settings_dict
 from bot.graph_traversal import GraphTraversal
 from bot.api_clients import (
-    EVMExplorerClient, AnkrClient, EVMWeb3Client, HeliusClient, CascadePriceFetcher
+    EVMExplorerClient, AnkrClient, EVMWeb3Client, HeliusClient, CascadePriceFetcher, JupiterMassPrice
 )
 from bot.networks.ethereum import EthereumNetwork
 from bot.networks.bsc import BscNetwork
@@ -288,20 +288,38 @@ async def run_solana_history(query, context):
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
-            traversal = SolanaTraversal(session, address, helius, max_depth=3, max_tokens=50)
+            traversal = SolanaTraversal(session, address, helius, max_depth=3, max_tokens=100)
             found = await traversal.run()
             if not found:
                 await query.edit_message_text("✅ Анализ завершён. Токены не найдены.")
                 return
-            unique = {}
+
+            # Получаем имена токенов через Jupiter (один запрос)
+            unique_mints = list({item['token'] for item in found})
+            jupiter = JupiterMassPrice()
+            # Jupiter возвращает {mint: {price, name}}, но нам нужны только имена
+            names = {}
+            if unique_mints:
+                # Используем тот же метод get_prices, но он возвращает только цены. Поэтому запросим напрямую.
+                ids = ",".join(unique_mints[:100])
+                url = f"https://price.jup.ag/v4/price?ids={ids}"
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for mint, info in data.get("data", {}).items():
+                            name = info.get("name") or info.get("symbol") or "?"
+                            names[mint] = name
+
+            token_lines = []
             for item in found:
                 addr = item['token']
-                if addr not in unique:
-                    unique[addr] = item
-            token_lines = [f"• <a href='https://dexscreener.com/solana/{addr}'>{data['symbol']}</a> (<code>{addr}</code>)" for addr, data in unique.items()]
-            report = f"✅ <b>История покупок Solana</b>\nНайдено токенов: {len(unique)}\n" + "\n".join(token_lines)
+                symbol = names.get(addr, "?")
+                link = f"https://dexscreener.com/solana/{addr}"
+                token_lines.append(f"• <a href='{link}'>{symbol}</a> (<code>{addr}</code>)")
+
+            report = f"✅ <b>История покупок Solana</b>\nНайдено токенов: {len(found)}\n" + "\n".join(token_lines)
             await _send_long_message(context.bot, query.message.chat_id, report, parse_mode="HTML")
-            await query.edit_message_text("✅ Готово.")
+            # Не отправляем отдельное "Готово"
     except Exception as e:
         logger.exception("Ошибка истории Solana")
         await query.edit_message_text(f"❌ Ошибка: {e}")
