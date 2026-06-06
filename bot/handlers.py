@@ -54,7 +54,6 @@ def _check_access(update: Update) -> bool:
         return False
     return True
 
-# Стандартные команды
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
     await update.message.reply_text(
@@ -82,7 +81,6 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{service}: {count}\n"
     await update.message.reply_text(msg, parse_mode="HTML")
 
-# Основной обработчик
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
     if context.user_data.get('awaiting_setting'):
@@ -103,7 +101,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_solana_balance(update, context)
     else:
         await update.message.reply_text("❌ Адрес не распознан (ни EVM, ни Solana).")
-        return
 
 async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = context.user_data['address']
@@ -111,7 +108,6 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ankr:
         await update.message.reply_text("❌ Ankr не настроен.")
         return
-
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
@@ -119,15 +115,12 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not data:
                 await update.message.reply_text("❌ Не удалось получить данные от Ankr.")
                 return
-
             assets = data.get("assets", [])
             total_usd = float(data.get("totalBalanceUsd", 0))
             lines = [f"💰 <b>Баланс кошелька</b>\n<code>{address}</code>\n"
                      f"Общая стоимость: ≈ ${total_usd:,.2f}\n"]
-
             eth_assets = [a for a in assets if a.get("blockchain") == "eth"]
             bsc_assets = [a for a in assets if a.get("blockchain") == "bsc"]
-
             for chain_name, chain_assets, native_sym in [
                 ("Ethereum", eth_assets, "ETH"),
                 ("BSC", bsc_assets, "BNB")
@@ -146,13 +139,10 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         lines.append(f"• <a href='{link}'>{sym}</a>: {bal:.4f} ({display})")
                     else:
                         lines.append(f"• {sym}: {bal:.4f} ({display})")
-
             text = "\n".join(lines)
             await _send_long_message(context.bot, update.effective_chat.id, text, parse_mode="HTML")
-
             keyboard = [[InlineKeyboardButton("📜 История покупок", callback_data="history_evm")]]
             await update.message.reply_text("Выберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
-
     except Exception as e:
         logger.exception("Ошибка получения EVM балансов")
         await update.message.reply_text(f"❌ Ошибка: {e}")
@@ -173,12 +163,10 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
             balances = data.get("balances", [])
             lines = [f"💰 <b>Баланс Solana</b>\n<code>{address}</code>"]
-
             no_price_mints = [tok["mint"] for tok in balances if tok.get("usdValue") is None]
             additional_prices = {}
             if no_price_mints:
                 additional_prices = await cascade.get_prices(session, no_price_mints)
-
             total_usd = 0.0
             for tok in balances:
                 symbol = tok.get("symbol") or tok.get("name", "?")
@@ -193,39 +181,31 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
                         usd_val = bal * price
                     else:
                         usd_val = None
-
                 if usd_val is not None and usd_val < MIN_USD_VALUE:
                     continue
-
                 if usd_val is not None:
                     total_usd += usd_val
                     price_display = f"≈ ${usd_val:,.2f}"
                 else:
                     price_display = "?"
-
                 link = f"https://dexscreener.com/solana/{mint}" if mint else ""
                 if link:
                     lines.append(f"• <a href='{link}'>{symbol}</a>: {bal:.4f} ({price_display})")
                 else:
                     lines.append(f"• {symbol}: {bal:.4f} ({price_display})")
-
             lines.insert(1, f"Общая стоимость: ≈ ${total_usd:,.2f}")
             text = "\n".join(lines)
             await _send_long_message(context.bot, update.effective_chat.id, text, parse_mode="HTML")
-
             keyboard = [[InlineKeyboardButton("📜 История покупок", callback_data="history_solana")]]
             await update.message.reply_text("Выберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
-
     except Exception as e:
         logger.exception("Ошибка получения Solana баланса")
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
-# Обработчик кнопок
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-
     if data == "history_evm":
         keyboard = [
             [InlineKeyboardButton("Ethereum", callback_data="history_eth")],
@@ -258,7 +238,6 @@ async def run_evm_history(query, context, chain: str):
                                      router_address=conf.get("dex_routers", [""])[0],
                                      stable_address=conf.get("stablecoins", [""])[0])
                 network = BscNetwork(conf, session, web3)
-
             traversal = GraphTraversal(session, address, network, max_tokens=100, lookback_days=30, max_depth=3)
             found = await traversal.run()
             if not found:
@@ -277,13 +256,11 @@ async def run_evm_history(query, context, chain: str):
         logger.exception("Ошибка истории EVM")
         await query.edit_message_text(f"❌ Ошибка: {e}")
 
-# Каскадное получение имён токенов Solana
 async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
     names = {}
     if not mints:
         return names
-
-    # 1. Jupiter (массовый запрос до 100 токенов)
+    # 1. Jupiter
     try:
         ids = ",".join(mints[:100])
         url = f"https://price.jup.ag/v4/price?ids={ids}"
@@ -297,12 +274,10 @@ async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
                             names[mint] = name
     except Exception as e:
         logger.warning(f"Jupiter имена недоступны: {e}")
-
     remaining = [m for m in mints if m not in names]
     if not remaining:
         return names
-
-    # 2. Birdeye (индивидуальные запросы, если есть API-ключ)
+    # 2. Birdeye
     if BIRDEYE_API_KEY:
         for mint in remaining[:]:
             try:
@@ -312,14 +287,14 @@ async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
                         data = await resp.json()
                         if isinstance(data, dict) and "data" in data and isinstance(data["data"], dict):
                             token_data = data["data"]
-                            name = token_data.get("name") or token_data.get("symbol")
-                            if name:
-                                names[mint] = name
-                                remaining.remove(mint)
+                            if isinstance(token_data, dict):
+                                name = token_data.get("name") or token_data.get("symbol")
+                                if name:
+                                    names[mint] = name
+                                    remaining.remove(mint)
             except:
                 pass
             await asyncio.sleep(0.3)
-
     # 3. DexScreener
     for mint in remaining[:]:
         try:
@@ -338,11 +313,9 @@ async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
         except:
             pass
         await asyncio.sleep(0.3)
-
-    # 4. Сокращённый адрес для оставшихся
+    # 4. Сокращённый адрес
     for mint in remaining:
         names[mint] = f"{mint[:6]}...{mint[-4:]}"
-
     return names
 
 async def run_solana_history(query, context):
@@ -359,21 +332,18 @@ async def run_solana_history(query, context):
             if not found:
                 await query.edit_message_text("✅ Анализ завершён. Токены не найдены.")
                 return
-
             unique_mints = list({item['token'] for item in found})
             try:
                 names = await get_token_names_cascade(session, unique_mints)
             except Exception as e:
                 logger.warning(f"Не удалось получить имена токенов: {e}")
                 names = {}
-
             token_lines = []
             for item in found:
                 addr = item['token']
                 symbol = names.get(addr, "?")
                 link = f"https://dexscreener.com/solana/{addr}"
                 token_lines.append(f"• <a href='{link}'>{symbol}</a> (<code>{addr}</code>)")
-
             report = f"✅ <b>История покупок Solana</b>\nНайдено токенов: {len(found)}\n" + "\n".join(token_lines)
             await _send_long_message(context.bot, query.message.chat_id, report, parse_mode="HTML")
     except Exception as e:
