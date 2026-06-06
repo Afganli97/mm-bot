@@ -11,7 +11,7 @@ from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters, 
 from bot.config import (
     TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, NETWORKS,
     DEFAULT_MAX_DEPTH, DEFAULT_LOOKBACK_DAYS, DEFAULT_MIN_TRANSFER_VALUE_ETH,
-    DEFAULT_MAX_FOUND_TOKENS, MIN_USD_VALUE
+    DEFAULT_MAX_FOUND_TOKENS, MIN_USD_VALUE, BIRDEYE_API_KEY
 )
 from bot.database import get_all_api_usage, get_user_setting, set_user_setting, get_user_settings_dict
 from bot.graph_traversal import GraphTraversal
@@ -277,69 +277,68 @@ async def run_evm_history(query, context, chain: str):
         logger.exception("Ошибка истории EVM")
         await query.edit_message_text(f"❌ Ошибка: {e}")
 
+# Каскадное получение имён токенов Solana
 async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
-    """
-    Каскадное получение имён токенов Solana.
-    Порядок: Jupiter (массовый) → Birdeye (по одному) → DexScreener → сокращённый адрес.
-    Возвращает словарь {mint: name}.
-    """
     names = {}
     if not mints:
         return names
 
-    # 1. Jupiter (массовый запрос)
+    # 1. Jupiter (массовый запрос до 100 токенов)
     try:
         ids = ",".join(mints[:100])
         url = f"https://price.jup.ag/v4/price?ids={ids}"
         async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                for mint, info in data.get("data", {}).items():
-                    name = info.get("name") or info.get("symbol") or "?"
-                    names[mint] = name
+                if isinstance(data, dict) and "data" in data:
+                    for mint, info in data["data"].items():
+                        if isinstance(info, dict):
+                            name = info.get("name") or info.get("symbol") or "?"
+                            names[mint] = name
     except Exception as e:
         logger.warning(f"Jupiter имена недоступны: {e}")
 
-    # Оставшиеся без имени
     remaining = [m for m in mints if m not in names]
     if not remaining:
         return names
 
-    # 2. Birdeye (по одному)
-    birdeye = BirdeyePrice.__new__(BirdeyePrice) if BIRDEYE_API_KEY else None  # используем ключ из config
-    if birdeye:
+    # 2. Birdeye (индивидуальные запросы, если есть API-ключ)
+    if BIRDEYE_API_KEY:
         for mint in remaining[:]:
             try:
-                async with session.get(
-                    f"https://public-api.birdeye.so/defi/token_overview?address={mint}&x-chain=solana",
-                    headers={"X-API-KEY": BIRDEYE_API_KEY},
-                    timeout=5
-                ) as resp:
+                url = f"https://public-api.birdeye.so/defi/token_overview?address={mint}&x-chain=solana"
+                async with session.get(url, headers={"X-API-KEY": BIRDEYE_API_KEY}, timeout=5) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        name = data.get("data", {}).get("name") or data.get("data", {}).get("symbol")
-                        if name:
-                            names[mint] = name
-                            remaining.remove(mint)
+                        if isinstance(data, dict) and "data" in data:
+                            token_data = data["data"]
+                            if isinstance(token_data, dict):
+                                name = token_data.get("name") or token_data.get("symbol")
+                                if name:
+                                    names[mint] = name
+                                    remaining.remove(mint)
             except:
                 pass
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.3)
 
     # 3. DexScreener
     for mint in remaining[:]:
         try:
-            async with session.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5) as resp:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+            async with session.get(url, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     pairs = data.get("pairs")
-                    if pairs:
-                        name = pairs[0].get("baseToken", {}).get("name") or pairs[0].get("baseToken", {}).get("symbol")
-                        if name:
-                            names[mint] = name
-                            remaining.remove(mint)
+                    if pairs and isinstance(pairs, list) and len(pairs) > 0:
+                        base = pairs[0].get("baseToken")
+                        if isinstance(base, dict):
+                            name = base.get("name") or base.get("symbol")
+                            if name:
+                                names[mint] = name
+                                remaining.remove(mint)
         except:
             pass
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.3)
 
     # 4. Сокращённый адрес для оставшихся
     for mint in remaining:
@@ -362,7 +361,6 @@ async def run_solana_history(query, context):
                 await query.edit_message_text("✅ Анализ завершён. Токены не найдены.")
                 return
 
-            # Получаем имена через каскад
             unique_mints = list({item['token'] for item in found})
             names = await get_token_names_cascade(session, unique_mints)
 
