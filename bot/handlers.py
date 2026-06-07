@@ -54,6 +54,7 @@ def _check_access(update: Update) -> bool:
         return False
     return True
 
+# Стандартные команды
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
     await update.message.reply_text(
@@ -81,6 +82,7 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{service}: {count}\n"
     await update.message.reply_text(msg, parse_mode="HTML")
 
+# Основной обработчик
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
     if context.user_data.get('awaiting_setting'):
@@ -101,6 +103,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_solana_balance(update, context)
     else:
         await update.message.reply_text("❌ Адрес не распознан (ни EVM, ни Solana).")
+        return
 
 async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = context.user_data['address']
@@ -108,6 +111,7 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ankr:
         await update.message.reply_text("❌ Ankr не настроен.")
         return
+
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
@@ -115,12 +119,21 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not data:
                 await update.message.reply_text("❌ Не удалось получить данные от Ankr.")
                 return
+
             assets = data.get("assets", [])
-            total_usd = float(data.get("totalBalanceUsd", 0))
+            # Безопасное извлечение totalBalanceUsd
+            total_usd_str = data.get("totalBalanceUsd", "0")
+            try:
+                total_usd = float(total_usd_str) if total_usd_str else 0.0
+            except (ValueError, TypeError):
+                total_usd = 0.0
+
             lines = [f"💰 <b>Баланс кошелька</b>\n<code>{address}</code>\n"
                      f"Общая стоимость: ≈ ${total_usd:,.2f}\n"]
+
             eth_assets = [a for a in assets if a.get("blockchain") == "eth"]
             bsc_assets = [a for a in assets if a.get("blockchain") == "bsc"]
+
             for chain_name, chain_assets, native_sym in [
                 ("Ethereum", eth_assets, "ETH"),
                 ("BSC", bsc_assets, "BNB")
@@ -128,10 +141,22 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"\n⛓️ <b>{chain_name}</b>")
                 for a in chain_assets:
                     sym = a.get("tokenSymbol", "?")
-                    bal = float(a.get("balance", 0))
-                    usd_val = float(a.get("balanceUsd", 0))
+                    bal_str = a.get("balance", "0")
+                    usd_str = a.get("balanceUsd", "0")
+
+                    # Безопасное преобразование
+                    try:
+                        bal = float(bal_str) if bal_str else 0.0
+                    except (ValueError, TypeError):
+                        bal = 0.0
+                    try:
+                        usd_val = float(usd_str) if usd_str else 0.0
+                    except (ValueError, TypeError):
+                        usd_val = 0.0
+
                     if usd_val < MIN_USD_VALUE and sym != native_sym:
                         continue
+
                     display = f"≈ ${usd_val:,.2f}" if usd_val > 0 else "?"
                     contract = a.get("tokenAddress", "")
                     link = f"https://dexscreener.com/{chain_name.lower()}/{contract}" if contract else ""
@@ -139,10 +164,13 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         lines.append(f"• <a href='{link}'>{sym}</a>: {bal:.4f} ({display})")
                     else:
                         lines.append(f"• {sym}: {bal:.4f} ({display})")
+
             text = "\n".join(lines)
             await _send_long_message(context.bot, update.effective_chat.id, text, parse_mode="HTML")
+
             keyboard = [[InlineKeyboardButton("📜 История покупок", callback_data="history_evm")]]
             await update.message.reply_text("Выберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
+
     except Exception as e:
         logger.exception("Ошибка получения EVM балансов")
         await update.message.reply_text(f"❌ Ошибка: {e}")
@@ -163,10 +191,12 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
             balances = data.get("balances", [])
             lines = [f"💰 <b>Баланс Solana</b>\n<code>{address}</code>"]
+
             no_price_mints = [tok["mint"] for tok in balances if tok.get("usdValue") is None]
             additional_prices = {}
             if no_price_mints:
                 additional_prices = await cascade.get_prices(session, no_price_mints)
+
             total_usd = 0.0
             for tok in balances:
                 symbol = tok.get("symbol") or tok.get("name", "?")
@@ -181,31 +211,39 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
                         usd_val = bal * price
                     else:
                         usd_val = None
+
                 if usd_val is not None and usd_val < MIN_USD_VALUE:
                     continue
+
                 if usd_val is not None:
                     total_usd += usd_val
                     price_display = f"≈ ${usd_val:,.2f}"
                 else:
                     price_display = "?"
+
                 link = f"https://dexscreener.com/solana/{mint}" if mint else ""
                 if link:
                     lines.append(f"• <a href='{link}'>{symbol}</a>: {bal:.4f} ({price_display})")
                 else:
                     lines.append(f"• {symbol}: {bal:.4f} ({price_display})")
+
             lines.insert(1, f"Общая стоимость: ≈ ${total_usd:,.2f}")
             text = "\n".join(lines)
             await _send_long_message(context.bot, update.effective_chat.id, text, parse_mode="HTML")
+
             keyboard = [[InlineKeyboardButton("📜 История покупок", callback_data="history_solana")]]
             await update.message.reply_text("Выберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
+
     except Exception as e:
         logger.exception("Ошибка получения Solana баланса")
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
+# Обработчик кнопок
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+
     if data == "history_evm":
         keyboard = [
             [InlineKeyboardButton("Ethereum", callback_data="history_eth")],
@@ -238,6 +276,7 @@ async def run_evm_history(query, context, chain: str):
                                      router_address=conf.get("dex_routers", [""])[0],
                                      stable_address=conf.get("stablecoins", [""])[0])
                 network = BscNetwork(conf, session, web3)
+
             traversal = GraphTraversal(session, address, network, max_tokens=100, lookback_days=30, max_depth=3)
             found = await traversal.run()
             if not found:
