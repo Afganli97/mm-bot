@@ -121,15 +121,8 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             assets = data.get("assets", [])
-            # Безопасное извлечение totalBalanceUsd
-            total_usd_str = data.get("totalBalanceUsd", "0")
-            try:
-                total_usd = float(total_usd_str) if total_usd_str else 0.0
-            except (ValueError, TypeError):
-                total_usd = 0.0
-
-            lines = [f"💰 <b>Баланс кошелька</b>\n<code>{address}</code>\n"
-                     f"Общая стоимость: ≈ ${total_usd:,.2f}\n"]
+            # Общий итог оставим для совместимости, но выводить будем отдельно по сетям
+            lines = [f"💰 <b>Баланс кошелька</b>\n<code>{address}</code>"]
 
             eth_assets = [a for a in assets if a.get("blockchain") == "eth"]
             bsc_assets = [a for a in assets if a.get("blockchain") == "bsc"]
@@ -138,13 +131,12 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ("Ethereum", eth_assets, "ETH"),
                 ("BSC", bsc_assets, "BNB")
             ]:
-                lines.append(f"\n⛓️ <b>{chain_name}</b>")
+                network_total = 0.0
+                network_lines = []
                 for a in chain_assets:
                     sym = a.get("tokenSymbol", "?")
                     bal_str = a.get("balance", "0")
                     usd_str = a.get("balanceUsd", "0")
-
-                    # Безопасное преобразование
                     try:
                         bal = float(bal_str) if bal_str else 0.0
                     except (ValueError, TypeError):
@@ -154,16 +146,29 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except (ValueError, TypeError):
                         usd_val = 0.0
 
-                    if usd_val < MIN_USD_VALUE and sym != native_sym:
-                        continue
+                    # Для диагностики временно отключаем фильтр для Ethereum, чтобы увидеть все токены
+                    if chain_name == "Ethereum":
+                        if usd_val < 0.0:   # всегда ложь, показываем все
+                            continue
+                    else:
+                        if usd_val < MIN_USD_VALUE and sym != native_sym:
+                            continue
 
                     display = f"≈ ${usd_val:,.2f}" if usd_val > 0 else "?"
                     contract = a.get("tokenAddress", "")
-                    link = f"https://dexscreener.com/{chain_name.lower()}/{contract}" if contract else ""
-                    if link:
-                        lines.append(f"• <a href='{link}'>{sym}</a>: {bal:.4f} ({display})")
+                    # Формируем ссылку, если адрес контракта не пустой и не является нативным токеном
+                    if contract and contract.lower() != "0x0000000000000000000000000000000000000000" and sym != native_sym:
+                        link = f"https://dexscreener.com/{chain_name.lower()}/{contract}"
+                        line = f"• <a href='{link}'>{sym}</a>: {bal:.4f} ({display})"
                     else:
-                        lines.append(f"• {sym}: {bal:.4f} ({display})")
+                        line = f"• {sym}: {bal:.4f} ({display})"
+                    network_lines.append(line)
+                    if usd_val > 0:
+                        network_total += usd_val
+
+                lines.append(f"\n⛓️ <b>{chain_name}</b>")
+                lines.append(f"Общая стоимость в сети: ≈ ${network_total:,.2f}")
+                lines.extend(network_lines)
 
             text = "\n".join(lines)
             await _send_long_message(context.bot, update.effective_chat.id, text, parse_mode="HTML")
@@ -243,6 +248,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    logger.info(f"Button clicked: {data}")   # диагностика
 
     if data == "history_evm":
         keyboard = [
@@ -257,6 +263,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chain = data.split("_")[1]
         await query.edit_message_text(f"⏳ Запущен анализ истории покупок {chain}...")
         await run_evm_history(query, context, chain)
+    else:
+        logger.warning(f"Unknown button data: {data}")
 
 async def run_evm_history(query, context, chain: str):
     address = context.user_data['address']
@@ -457,5 +465,6 @@ def register_handlers(app):
     app.add_handler(CommandHandler("dashboard", dashboard))
     app.add_handler(CommandHandler("settings", settings))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Обработчики колбэков
     app.add_handler(CallbackQueryHandler(button_handler, pattern="^(history_|history_eth|history_bsc|history_solana)$"))
     app.add_handler(CallbackQueryHandler(settings_button, pattern="^(set_|reset_settings).*"))
