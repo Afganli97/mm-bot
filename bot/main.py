@@ -5,10 +5,10 @@ import logging
 from aiohttp import ClientSession
 from telegram.ext import ApplicationBuilder
 
-from bot.config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, LOG_FILE, ETHERSCAN_API_KEYS, ANKR_API_URL, HELIUS_API_KEY
+from bot.config import TELEGRAM_BOT_TOKEN, LOG_LEVEL, LOG_FILE, ETHERSCAN_API_KEYS, ANKR_API_URL, HELIUS_API_KEY, MORALIS_API_KEY
 from bot.database import init_db
 from bot.handlers import register_handlers
-from bot.api_clients import AnkrClient, HeliusClient, CascadePriceFetcher
+from bot.api_clients import AnkrClient, HeliusClient, CascadePriceFetcher, MoralisClient
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
@@ -28,6 +28,10 @@ async def post_init(app):
         app.bot_data['cascade'] = CascadePriceFetcher(helius)
     else:
         logger.warning("Helius API ключ не задан, балансы Solana не будут работать")
+    if MORALIS_API_KEY:
+        app.bot_data['moralis'] = MoralisClient(MORALIS_API_KEY)
+    else:
+        logger.warning("Moralis API ключ не задан, балансы Ethereum могут быть неполными")
     app.bot_data['etherscan_keys'] = ETHERSCAN_API_KEYS
 
 async def post_shutdown(app):
