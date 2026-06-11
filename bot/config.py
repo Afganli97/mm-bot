@@ -25,6 +25,7 @@ INFURA_API_KEY = os.getenv("INFURA_API_KEY", "")
 # Ankr Advanced API – основной источник балансов EVM
 ANKR_API_KEY = os.getenv("ANKR_API_KEY", "")
 ANKR_API_URL = f"https://rpc.ankr.com/multichain/{ANKR_API_KEY}" if ANKR_API_KEY else "https://rpc.ankr.com/multichain"
+MORALIS_API_KEY = os.getenv("MORALIS_API_KEY", "")
 
 # Solana
 SOLSCAN_API_KEY = os.getenv("SOLSCAN_API_KEY", "")
