@@ -11,13 +11,13 @@ from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters, 
 from bot.config import (
     TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, NETWORKS,
     DEFAULT_MAX_DEPTH, DEFAULT_LOOKBACK_DAYS, DEFAULT_MIN_TRANSFER_VALUE_ETH,
-    DEFAULT_MAX_FOUND_TOKENS, MIN_USD_VALUE, BIRDEYE_API_KEY
+    DEFAULT_MAX_FOUND_TOKENS, MIN_USD_VALUE, BIRDEYE_API_KEY, ALCHEMY_URL
 )
 from bot.database import get_all_api_usage, get_user_setting, set_user_setting, get_user_settings_dict
 from bot.graph_traversal import GraphTraversal
 from bot.api_clients import (
     EVMExplorerClient, AnkrClient, EVMWeb3Client, HeliusClient, CascadePriceFetcher,
-    JupiterMassPrice, BirdeyePrice, DexScreenerPrice, MoralisClient, EVMPriceCascade
+    JupiterMassPrice, BirdeyePrice, DexScreenerPrice, MoralisClient, EVMPriceCascade, TokenInfoService
 )
 from bot.networks.ethereum import EthereumNetwork
 from bot.networks.bsc import BscNetwork
@@ -105,6 +105,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Адрес не распознан (ни EVM, ни Solana).")
         return
 
+# Вспомогательные функции для Alchemy и токенов
+async def _get_alchemy_token_balances(session, address: str) -> List[Dict]:
+    """Возвращает список всех токенов с ненулевым балансом через Alchemy."""
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "alchemy_getTokenBalances",
+        "params": [address],
+        "id": 1
+    }
+    try:
+        async with session.post(ALCHEMY_URL, json=payload, timeout=30) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                result = data.get("result", {})
+                tokens = result.get("tokenBalances", [])
+                # Оставляем только ненулевые балансы
+                return [t for t in tokens if t.get("tokenBalance", "0x0") != "0x0000000000000000000000000000000000000000000000000000000000000000"]
+    except Exception as e:
+        logger.warning(f"Alchemy token balances failed: {e}")
+    return []
+
+async def _get_decimals(session, contract_address: str, rpc_url: str) -> int:
+    """Получает decimals токена через eth_call."""
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": contract_address, "data": "0x313ce567"}, "latest"],
+        "id": 1
+    }
+    try:
+        async with session.post(rpc_url, json=payload, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                result = data.get("result")
+                if result and result != "0x":
+                    return int(result, 16)
+    except:
+        pass
+    return 18  # fallback
+
 async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = context.user_data['address']
     moralis: MoralisClient = context.application.bot_data.get('moralis')
@@ -127,20 +167,55 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # --- Ethereum ---
             eth_total = 0.0
             eth_lines = []
-            # Каскад цен для EVM (используем web3 для Ethereum)
+            # Каскад цен для EVM
             eth_conf = NETWORKS["ethereum"]
-            eth_web3 = EVMWeb3Client(eth_conf["rpc_url"], eth_conf["chain_id"], eth_conf["weth"],
+            rpc_url = eth_conf["rpc_url"]
+            eth_web3 = EVMWeb3Client(rpc_url, eth_conf["chain_id"], eth_conf["weth"],
                                      router=eth_conf.get("dex_routers", [""])[0],
                                      stable=eth_conf.get("stablecoins", [""])[0])
             evm_cascade = EVMPriceCascade(eth_web3)
 
+            # Множество адресов контрактов из Moralis (для проверки пропавших)
+            moralis_contracts = set()
+            for t in eth_tokens:
+                contract = (t.get("contract_address") or "").lower()
+                if contract and contract != "0x0000000000000000000000000000000000000000":
+                    moralis_contracts.add(contract)
+
+            # Получаем полный список токенов через Alchemy
+            alchemy_tokens = await _get_alchemy_token_balances(session, address)
+            missing_tokens = []  # токены, которых нет в Moralis
+
+            for at in alchemy_tokens:
+                contract_addr = at.get("contractAddress", "").lower()
+                if not contract_addr or contract_addr == "0x0000000000000000000000000000000000000000":
+                    continue
+                if contract_addr in moralis_contracts:
+                    continue
+                # Пропавший токен
+                raw_balance = int(at.get("tokenBalance", "0x0"), 16)
+                if raw_balance == 0:
+                    continue
+                symbol = await TokenInfoService.get_symbol(session, contract_addr, rpc_url)
+                decimals = await _get_decimals(session, contract_addr, rpc_url)
+                balance = raw_balance / (10 ** decimals)
+                # Получаем цену
+                price = await evm_cascade.get_price(session, contract_addr, "ethereum", 0.0)
+                usd_val = balance * price if price else 0.0
+                missing_tokens.append({
+                    "symbol": symbol,
+                    "balance": balance,
+                    "usd_val": usd_val,
+                    "contract": contract_addr
+                })
+
+            # Обрабатываем Moralis токены
             for t in eth_tokens:
                 symbol = t.get("symbol", "?")
                 balance = float(t.get("balance_formatted", 0))
                 usd_val = float(t.get("usd_value", 0))
                 contract = t.get("contract_address", "")
                 if usd_val == 0.0:
-                    # Запускаем каскад
                     price = await evm_cascade.get_price(session, contract, "ethereum", 0.0)
                     if price:
                         usd_val = balance * price
@@ -151,11 +226,23 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     display = f"≈ ${usd_val:,.2f}"
                 else:
                     display = "?"
-                link = f"https://dexscreener.com/ethereum/{contract}" if contract else ""
-                if link:
+                if contract and contract.lower() != "0x0000000000000000000000000000000000000000":
+                    link = f"https://dexscreener.com/ethereum/{contract}"
                     eth_lines.append(f"• <a href='{link}'>{symbol}</a>: {balance:.4f} ({display})")
                 else:
                     eth_lines.append(f"• {symbol}: {balance:.4f} ({display})")
+
+            # Добавляем пропавшие токены
+            for mt in missing_tokens:
+                if mt["usd_val"] > 0 and mt["usd_val"] < MIN_USD_VALUE:
+                    continue
+                if mt["usd_val"] > 0:
+                    eth_total += mt["usd_val"]
+                    display = f"≈ ${mt['usd_val']:,.2f}"
+                else:
+                    display = "?"
+                link = f"https://dexscreener.com/ethereum/{mt['contract']}"
+                eth_lines.append(f"• <a href='{link}'>{mt['symbol']}</a>: {mt['balance']:.4f} ({display})")
 
             lines.append("\n⛓️ <b>Ethereum</b>")
             lines.append(f"Общая стоимость в сети: ≈ ${eth_total:,.2f}")
@@ -176,8 +263,8 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     display = "?"
                 contract = a.get("contractAddress", "")
-                link = f"https://dexscreener.com/bsc/{contract}" if contract else ""
-                if link:
+                if contract and contract.lower() != "0x0000000000000000000000000000000000000000":
+                    link = f"https://dexscreener.com/bsc/{contract}"
                     bsc_lines.append(f"• <a href='{link}'>{sym}</a>: {bal:.4f} ({display})")
                 else:
                     bsc_lines.append(f"• {sym}: {bal:.4f} ({display})")
@@ -260,19 +347,23 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 # Обработчик кнопок
+async def history_evm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    logger.info(f"Button clicked: history_evm")
+    keyboard = [
+        [InlineKeyboardButton("Ethereum", callback_data="history_eth")],
+        [InlineKeyboardButton("BSC", callback_data="history_bsc")]
+    ]
+    await query.edit_message_text("Выберите сеть для истории:", reply_markup=InlineKeyboardMarkup(keyboard))
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     logger.info(f"Button clicked: {data}")
 
-    if data == "history_evm":
-        keyboard = [
-            [InlineKeyboardButton("Ethereum", callback_data="history_eth")],
-            [InlineKeyboardButton("BSC", callback_data="history_bsc")]
-        ]
-        await query.edit_message_text("Выберите сеть для истории:", reply_markup=InlineKeyboardMarkup(keyboard))
-    elif data == "history_solana":
+    if data == "history_solana":
         await query.edit_message_text("⏳ Запущен анализ истории покупок Solana...")
         await run_solana_history(query, context)
     elif data.startswith("history_"):
@@ -312,7 +403,7 @@ async def run_evm_history(query, context, chain: str):
             token_lines = [f"• <a href='https://dexscreener.com/{chain}/{addr}'>{data['symbol']}</a> (<code>{addr}</code>)" for addr, data in unique.items()]
             report = f"✅ <b>История покупок {chain.upper()}</b>\nНайдено токенов: {len(unique)}\n" + "\n".join(token_lines)
             await _send_long_message(context.bot, query.message.chat_id, report, parse_mode="HTML")
-            await query.edit_message_text("✅ Готово.")
+            # Убрано двойное сообщение "Готово"
     except Exception as e:
         logger.exception("Ошибка истории EVM")
         await query.edit_message_text(f"❌ Ошибка: {e}")
@@ -480,5 +571,7 @@ def register_handlers(app):
     app.add_handler(CommandHandler("dashboard", dashboard))
     app.add_handler(CommandHandler("settings", settings))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(history_|history_eth|history_bsc|history_solana)$"))
+    # Явный обработчик для history_evm, чтобы гарантировать вызов
+    app.add_handler(CallbackQueryHandler(history_evm_handler, pattern='history_evm'))
+    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(history_eth|history_bsc|history_solana)$"))
     app.add_handler(CallbackQueryHandler(settings_button, pattern="^(set_|reset_settings).*"))
