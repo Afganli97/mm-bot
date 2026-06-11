@@ -130,8 +130,8 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Каскад цен для EVM (используем web3 для Ethereum)
             eth_conf = NETWORKS["ethereum"]
             eth_web3 = EVMWeb3Client(eth_conf["rpc_url"], eth_conf["chain_id"], eth_conf["weth"],
-                                     router_address=eth_conf.get("dex_routers", [""])[0],
-                                     stable_address=eth_conf.get("stablecoins", [""])[0])
+                                     router=eth_conf.get("dex_routers", [""])[0],
+                                     stable=eth_conf.get("stablecoins", [""])[0])
             evm_cascade = EVMPriceCascade(eth_web3)
 
             for t in eth_tokens:
@@ -141,7 +141,7 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 contract = t.get("contract_address", "")
                 if usd_val == 0.0:
                     # Запускаем каскад
-                    price = await evm_cascade.get_price(session, contract, "ethereum", 0.0)  # weth_price можно взять из отдельного запроса
+                    price = await evm_cascade.get_price(session, contract, "ethereum", 0.0)
                     if price:
                         usd_val = balance * price
                 if usd_val > 0 and usd_val < MIN_USD_VALUE:
@@ -289,14 +289,14 @@ async def run_evm_history(query, context, chain: str):
                 conf = NETWORKS["ethereum"]
                 explorer = EVMExplorerClient(conf["chain_id"], conf["weth"])
                 web3 = EVMWeb3Client(conf["rpc_url"], conf["chain_id"], conf["weth"],
-                                     router_address=conf.get("dex_routers", [""])[0],
-                                     stable_address=conf.get("stablecoins", [""])[0])
+                                     router=conf.get("dex_routers", [""])[0],
+                                     stable=conf.get("stablecoins", [""])[0])
                 network = EthereumNetwork(conf, session, explorer, web3)
             else:
                 conf = NETWORKS["bsc"]
                 web3 = EVMWeb3Client(conf["rpc_url"], conf["chain_id"], conf["weth"],
-                                     router_address=conf.get("dex_routers", [""])[0],
-                                     stable_address=conf.get("stablecoins", [""])[0])
+                                     router=conf.get("dex_routers", [""])[0],
+                                     stable=conf.get("stablecoins", [""])[0])
                 network = BscNetwork(conf, session, web3)
 
             traversal = GraphTraversal(session, address, network, max_tokens=100, lookback_days=30, max_depth=3)
