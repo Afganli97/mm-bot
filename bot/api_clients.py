@@ -1,5 +1,5 @@
 """
-Клиенты для Etherscan, Ankr Multichain, RPC, Helius, каскадного определения цен.
+Клиенты для Etherscan, Ankr Multichain, RPC, Helius, Moralis, каскадного определения цен.
 """
 import asyncio
 import logging
@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from bot.config import (
     ETHERSCAN_API_KEYS, ANKR_API_URL,
-    HELIUS_API_KEY, HELIUS_URL, BIRDEYE_API_KEY
+    HELIUS_API_KEY, HELIUS_URL, BIRDEYE_API_KEY, MORALIS_API_KEY
 )
 from bot.database import increment_api_usage, get_api_usage_today
 
@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 ETHERSCAN_DAILY_LIMIT = 100_000
 ANKR_DAILY_LIMIT = 100_000
+MORALIS_DAILY_LIMIT = 1500  # бесплатный тариф ~1500 запросов/мес, но учтём посуточно
 
 class APIKeyRotator:
     def __init__(self, keys, service, daily_limit):
@@ -39,7 +40,7 @@ class APIKeyRotator:
                 return key, i
         return None
     async def make_request(self, session, url, params=None, headers=None, delay=0.4, chain_id=None):
-        if self.service == "etherscan":
+        if self.service in ("etherscan", "moralis"):
             await asyncio.sleep(delay)
         for attempt in range(len(self.keys)):
             key_info = self.get_available_key()
@@ -51,29 +52,45 @@ class APIKeyRotator:
                 params["apikey"] = key
                 if chain_id is not None:
                     params["chainid"] = chain_id
+            elif self.service == "moralis":
+                headers = headers or {}
+                headers["X-API-Key"] = key
             try:
-                async with session.get(url, params=params, timeout=30) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if self.service == "etherscan":
-                            if data.get("message") in ("No transactions found", "No records found"):
-                                increment_api_usage(self.service, idx)
-                                return {"status": "1", "message": "OK", "result": []}
-                            if data.get("status") == "1" or data.get("message") == "OK":
+                if self.service in ("etherscan", "moralis"):
+                    async with session.get(url, params=params, headers=headers, timeout=30) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if self.service == "etherscan":
+                                if data.get("message") in ("No transactions found", "No records found"):
+                                    increment_api_usage(self.service, idx)
+                                    return {"status": "1", "message": "OK", "result": []}
+                                if data.get("status") == "1" or data.get("message") == "OK":
+                                    increment_api_usage(self.service, idx)
+                                    return data
+                                elif data.get("message") == "NOTOK" and "limit" in data.get("result", "").lower():
+                                    continue
+                                else:
+                                    raise Exception(f"Etherscan: {data.get('result', 'Unknown error')}")
+                            else:
                                 increment_api_usage(self.service, idx)
                                 return data
-                            elif data.get("message") == "NOTOK" and "limit" in data.get("result", "").lower():
-                                continue
-                            else:
-                                raise Exception(f"Etherscan: {data.get('result', 'Unknown error')}")
+                        elif resp.status == 429:
+                            await asyncio.sleep(1)
+                            continue
                         else:
+                            raise Exception(f"HTTP {resp.status} от {self.service}")
+                else:
+                    # Для Ankr и Helius используем post
+                    async with session.post(url, json=params, timeout=30) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
                             increment_api_usage(self.service, idx)
                             return data
-                    elif resp.status == 429:
-                        await asyncio.sleep(1)
-                        continue
-                    else:
-                        raise Exception(f"HTTP {resp.status} от {self.service}")
+                        elif resp.status == 429:
+                            await asyncio.sleep(1)
+                            continue
+                        else:
+                            raise Exception(f"HTTP {resp.status} от {self.service}")
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.error(f"Сетевая ошибка: {e}")
                 raise
@@ -166,6 +183,29 @@ class AnkrClient:
                 logger.error(f"Ankr HTTP {resp.status}")
         return {}
 
+class MoralisClient:
+    """Клиент для Moralis API (балансы Ethereum с ценами и защитой от спама)."""
+    BASE_URL = "https://deep-index.moralis.io/api/v2.2"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.headers = {"X-API-Key": api_key}
+
+    async def get_balances(self, session, address: str, chain: str = "eth") -> List[Dict]:
+        """
+        Возвращает список токенов с полями:
+        - symbol, name, balance, balance_formatted, usd_value, possible_spam, contract_address (адрес контракта)
+        """
+        url = f"{self.BASE_URL}/wallets/{address}/tokens?chain={chain}&exclude_spam=true"
+        async with session.get(url, headers=self.headers, timeout=30) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                increment_api_usage("moralis", 0)
+                return data.get("result", [])
+            else:
+                logger.error(f"Moralis HTTP {resp.status}")
+                return []
+
 class HeliusClient:
     """Клиент для Helius API (Solana баланс и история)."""
     BASE_URL = "https://api.helius.xyz/v1"
@@ -257,9 +297,9 @@ class DexScreenerPrice:
         return None
 
 class GeckoTerminalPrice:
-    BASE_URL = "https://api.geckoterminal.com/api/v1/networks/solana/tokens"
-    async def get_price(self, session, mint: str) -> Optional[float]:
-        url = f"{self.BASE_URL}/{mint}"
+    BASE_URL = "https://api.geckoterminal.com/api/v1/networks"
+    async def get_price(self, session, mint: str, network: str = "solana") -> Optional[float]:
+        url = f"{self.BASE_URL}/{network}/tokens/{mint}"
         try:
             async with session.get(url, timeout=5) as resp:
                 if resp.status == 200:
@@ -281,16 +321,47 @@ class DexPaprikaPrice:
         except: pass
         return None
 
+class EVMPriceCascade:
+    """Каскадный определитель цены для EVM-токенов (DexScreener -> GeckoTerminal -> RPC-роутер)."""
+    def __init__(self, web3_client):
+        self.dexscr = DexScreenerPrice()
+        self.gecko = GeckoTerminalPrice()
+        self.web3 = web3_client
+
+    async def get_price(self, session, token_address: str, network_name: str = "ethereum", weth_price: float = 0.0) -> Optional[float]:
+        # 1. DexScreener
+        price = await self.dexscr.get_price(session, token_address)
+        if price: return price
+        await asyncio.sleep(0.2)
+
+        # 2. GeckoTerminal
+        gecko_net = {"ethereum": "eth", "bsc": "bsc", "eth": "eth"}.get(network_name, "eth")
+        price = await self.gecko.get_price(session, token_address, gecko_net)
+        if price: return price
+        await asyncio.sleep(0.2)
+
+        # 3. RPC-роутер (если web3_client передан)
+        if self.web3:
+            try:
+                price = await self.web3.get_price_via_router(session, token_address, weth_price)
+                if price: return price
+            except: pass
+        return None
+
 class CascadePriceFetcher:
+    """Каскадный определитель цены для Solana (Jupiter -> Birdeye -> DexScreener -> ...)."""
     def __init__(self, helius: HeliusClient):
         self.jupiter = JupiterMassPrice()
         self.birdeye = BirdeyePrice(BIRDEYE_API_KEY) if BIRDEYE_API_KEY else None
         self.dexscr = DexScreenerPrice()
         self.gecko = GeckoTerminalPrice()
         self.dexpaprika = DexPaprikaPrice()
+        if not BIRDEYE_API_KEY:
+            logger.warning("BIRDEYE_API_KEY is empty, Birdeye step will be skipped")
 
     async def get_prices(self, session, mints: List[str]) -> Dict[str, float]:
         prices = {}
+        logger.info(f"Cascade: getting prices for {len(mints)} tokens: {mints}")
         if mints:
             prices.update(await self.jupiter.get_prices(session, mints))
         remaining = [m for m in mints if m not in prices]
@@ -308,7 +379,7 @@ class CascadePriceFetcher:
                 prices[mint] = price
                 remaining.remove(mint)
         for mint in remaining[:]:
-            price = await self.gecko.get_price(session, mint)
+            price = await self.gecko.get_price(session, mint, "solana")
             await asyncio.sleep(0.2)
             if price: prices[mint] = price
         for mint in remaining[:]:
@@ -347,6 +418,43 @@ class EVMWeb3Client:
         if result and result != "0x":
             return int(result, 16)
         return 0
+
+    async def get_price_via_router(self, session, token_address: str, weth_price_usd: float) -> Optional[float]:
+        if not self.router_address or not self.stable_address:
+            return None
+        # Попытка 1: token -> WETH
+        try:
+            data = (f"0xd06ca61f"
+                    f"0000000000000000000000000000000000000000000000000de0b6b3a7640000"
+                    f"0000000000000000000000000000000000000000000000000000000000000040"
+                    f"0000000000000000000000000000000000000000000000000000000000000002"
+                    f"000000000000000000000000{token_address[2:]:0>64}"
+                    f"000000000000000000000000{self.weth_address[2:]:0>64}")
+            result = await self._rpc_call(session, "eth_call", [{"to": self.router_address, "data": data}, "latest"])
+            if result:
+                amounts_offset = int(result[2:66], 16)
+                weth_out = int(result[2 + amounts_offset + 64*2:], 16)
+                if weth_out > 0:
+                    return (weth_out / 1e18) * weth_price_usd
+        except Exception:
+            pass
+        # Попытка 2: token -> stablecoin
+        try:
+            data = (f"0xd06ca61f"
+                    f"0000000000000000000000000000000000000000000000000de0b6b3a7640000"
+                    f"0000000000000000000000000000000000000000000000000000000000000040"
+                    f"0000000000000000000000000000000000000000000000000000000000000002"
+                    f"000000000000000000000000{token_address[2:]:0>64}"
+                    f"000000000000000000000000{self.stable_address[2:]:0>64}")
+            result = await self._rpc_call(session, "eth_call", [{"to": self.router_address, "data": data}, "latest"])
+            if result:
+                amounts_offset = int(result[2:66], 16)
+                stable_out = int(result[2 + amounts_offset + 64*2:], 16)
+                if stable_out > 0:
+                    return stable_out / 1e18
+        except Exception:
+            pass
+        return None
 
 class TokenInfoService:
     @staticmethod
