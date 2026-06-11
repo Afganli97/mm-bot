@@ -11,7 +11,7 @@ from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters, 
 from bot.config import (
     TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, NETWORKS,
     DEFAULT_MAX_DEPTH, DEFAULT_LOOKBACK_DAYS, DEFAULT_MIN_TRANSFER_VALUE_ETH,
-    DEFAULT_MAX_FOUND_TOKENS, MIN_USD_VALUE, BIRDEYE_API_KEY, ALCHEMY_URL
+    DEFAULT_MAX_FOUND_TOKENS, MIN_USD_VALUE, BIRDEYE_API_KEY, ALCHEMY_API_KEY
 )
 from bot.database import get_all_api_usage, get_user_setting, set_user_setting, get_user_settings_dict
 from bot.graph_traversal import GraphTraversal
@@ -108,6 +108,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Вспомогательные функции для Alchemy и токенов
 async def _get_alchemy_token_balances(session, address: str) -> List[Dict]:
     """Возвращает список всех токенов с ненулевым балансом через Alchemy."""
+    alchemy_url = f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
     payload = {
         "jsonrpc": "2.0",
         "method": "alchemy_getTokenBalances",
@@ -115,7 +116,7 @@ async def _get_alchemy_token_balances(session, address: str) -> List[Dict]:
         "id": 1
     }
     try:
-        async with session.post(ALCHEMY_URL, json=payload, timeout=30) as resp:
+        async with session.post(alchemy_url, json=payload, timeout=30) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 result = data.get("result", {})
@@ -403,7 +404,6 @@ async def run_evm_history(query, context, chain: str):
             token_lines = [f"• <a href='https://dexscreener.com/{chain}/{addr}'>{data['symbol']}</a> (<code>{addr}</code>)" for addr, data in unique.items()]
             report = f"✅ <b>История покупок {chain.upper()}</b>\nНайдено токенов: {len(unique)}\n" + "\n".join(token_lines)
             await _send_long_message(context.bot, query.message.chat_id, report, parse_mode="HTML")
-            # Убрано двойное сообщение "Готово"
     except Exception as e:
         logger.exception("Ошибка истории EVM")
         await query.edit_message_text(f"❌ Ошибка: {e}")
