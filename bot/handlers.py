@@ -17,7 +17,7 @@ from bot.database import get_all_api_usage, get_user_setting, set_user_setting, 
 from bot.graph_traversal import GraphTraversal
 from bot.api_clients import (
     EVMExplorerClient, AnkrClient, EVMWeb3Client, HeliusClient, CascadePriceFetcher,
-    JupiterMassPrice, BirdeyePrice, DexScreenerPrice
+    JupiterMassPrice, BirdeyePrice, DexScreenerPrice, MoralisClient, EVMPriceCascade
 )
 from bot.networks.ethereum import EthereumNetwork
 from bot.networks.bsc import BscNetwork
@@ -107,68 +107,84 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = context.user_data['address']
+    moralis: MoralisClient = context.application.bot_data.get('moralis')
     ankr: AnkrClient = context.application.bot_data.get('ankr')
-    if not ankr:
-        await update.message.reply_text("❌ Ankr не настроен.")
+    if not moralis or not ankr:
+        await update.message.reply_text("❌ Moralis или Ankr не настроен.")
         return
 
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
-            data = await ankr.get_multichain_balances(session, address, chains=["eth", "bsc"])
-            if not data:
-                await update.message.reply_text("❌ Не удалось получить данные от Ankr.")
-                return
+            # Ethereum через Moralis
+            eth_tokens = await moralis.get_balances(session, address, chain="eth")
+            # BSC через Ankr
+            ankr_data = await ankr.get_multichain_balances(session, address, chains=["bsc"])
+            bsc_assets = ankr_data.get("assets", []) if ankr_data else []
 
-            assets = data.get("assets", [])
-            # Общий итог оставим для совместимости, но выводить будем отдельно по сетям
             lines = [f"💰 <b>Баланс кошелька</b>\n<code>{address}</code>"]
 
-            eth_assets = [a for a in assets if a.get("blockchain") == "eth"]
-            bsc_assets = [a for a in assets if a.get("blockchain") == "bsc"]
+            # --- Ethereum ---
+            eth_total = 0.0
+            eth_lines = []
+            # Каскад цен для EVM (используем web3 для Ethereum)
+            eth_conf = NETWORKS["ethereum"]
+            eth_web3 = EVMWeb3Client(eth_conf["rpc_url"], eth_conf["chain_id"], eth_conf["weth"],
+                                     router_address=eth_conf.get("dex_routers", [""])[0],
+                                     stable_address=eth_conf.get("stablecoins", [""])[0])
+            evm_cascade = EVMPriceCascade(eth_web3)
 
-            for chain_name, chain_assets, native_sym in [
-                ("Ethereum", eth_assets, "ETH"),
-                ("BSC", bsc_assets, "BNB")
-            ]:
-                network_total = 0.0
-                network_lines = []
-                for a in chain_assets:
-                    sym = a.get("tokenSymbol", "?")
-                    bal_str = a.get("balance", "0")
-                    usd_str = a.get("balanceUsd", "0")
-                    try:
-                        bal = float(bal_str) if bal_str else 0.0
-                    except (ValueError, TypeError):
-                        bal = 0.0
-                    try:
-                        usd_val = float(usd_str) if usd_str else 0.0
-                    except (ValueError, TypeError):
-                        usd_val = 0.0
+            for t in eth_tokens:
+                symbol = t.get("symbol", "?")
+                balance = float(t.get("balance_formatted", 0))
+                usd_val = float(t.get("usd_value", 0))
+                contract = t.get("contract_address", "")
+                if usd_val == 0.0:
+                    # Запускаем каскад
+                    price = await evm_cascade.get_price(session, contract, "ethereum", 0.0)  # weth_price можно взять из отдельного запроса
+                    if price:
+                        usd_val = balance * price
+                if usd_val > 0 and usd_val < MIN_USD_VALUE:
+                    continue
+                if usd_val > 0:
+                    eth_total += usd_val
+                    display = f"≈ ${usd_val:,.2f}"
+                else:
+                    display = "?"
+                link = f"https://dexscreener.com/ethereum/{contract}" if contract else ""
+                if link:
+                    eth_lines.append(f"• <a href='{link}'>{symbol}</a>: {balance:.4f} ({display})")
+                else:
+                    eth_lines.append(f"• {symbol}: {balance:.4f} ({display})")
 
-                    # Для диагностики временно отключаем фильтр для Ethereum, чтобы увидеть все токены
-                    if chain_name == "Ethereum":
-                        if usd_val < 0.0:   # всегда ложь, показываем все
-                            continue
-                    else:
-                        if usd_val < MIN_USD_VALUE and sym != native_sym:
-                            continue
+            lines.append("\n⛓️ <b>Ethereum</b>")
+            lines.append(f"Общая стоимость в сети: ≈ ${eth_total:,.2f}")
+            lines.extend(eth_lines)
 
-                    display = f"≈ ${usd_val:,.2f}" if usd_val > 0 else "?"
-                    contract = a.get("tokenAddress", "")
-                    # Формируем ссылку, если адрес контракта не пустой и не является нативным токеном
-                    if contract and contract.lower() != "0x0000000000000000000000000000000000000000" and sym != native_sym:
-                        link = f"https://dexscreener.com/{chain_name.lower()}/{contract}"
-                        line = f"• <a href='{link}'>{sym}</a>: {bal:.4f} ({display})"
-                    else:
-                        line = f"• {sym}: {bal:.4f} ({display})"
-                    network_lines.append(line)
-                    if usd_val > 0:
-                        network_total += usd_val
+            # --- BSC (Ankr) ---
+            bsc_total = 0.0
+            bsc_lines = []
+            for a in bsc_assets:
+                sym = a.get("tokenSymbol", "?")
+                bal = float(a.get("balance", 0))
+                usd_val = float(a.get("balanceUsd", 0))
+                if usd_val < MIN_USD_VALUE and sym != "BNB":
+                    continue
+                if usd_val > 0:
+                    bsc_total += usd_val
+                    display = f"≈ ${usd_val:,.2f}"
+                else:
+                    display = "?"
+                contract = a.get("contractAddress", "")
+                link = f"https://dexscreener.com/bsc/{contract}" if contract else ""
+                if link:
+                    bsc_lines.append(f"• <a href='{link}'>{sym}</a>: {bal:.4f} ({display})")
+                else:
+                    bsc_lines.append(f"• {sym}: {bal:.4f} ({display})")
 
-                lines.append(f"\n⛓️ <b>{chain_name}</b>")
-                lines.append(f"Общая стоимость в сети: ≈ ${network_total:,.2f}")
-                lines.extend(network_lines)
+            lines.append("\n⛓️ <b>BSC</b>")
+            lines.append(f"Общая стоимость в сети: ≈ ${bsc_total:,.2f}")
+            lines.extend(bsc_lines)
 
             text = "\n".join(lines)
             await _send_long_message(context.bot, update.effective_chat.id, text, parse_mode="HTML")
@@ -248,7 +264,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    logger.info(f"Button clicked: {data}")   # диагностика
+    logger.info(f"Button clicked: {data}")
 
     if data == "history_evm":
         keyboard = [
@@ -263,8 +279,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chain = data.split("_")[1]
         await query.edit_message_text(f"⏳ Запущен анализ истории покупок {chain}...")
         await run_evm_history(query, context, chain)
-    else:
-        logger.warning(f"Unknown button data: {data}")
 
 async def run_evm_history(query, context, chain: str):
     address = context.user_data['address']
@@ -303,6 +317,7 @@ async def run_evm_history(query, context, chain: str):
         logger.exception("Ошибка истории EVM")
         await query.edit_message_text(f"❌ Ошибка: {e}")
 
+# Каскадное получение имён токенов Solana
 async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
     names = {}
     if not mints:
@@ -465,6 +480,5 @@ def register_handlers(app):
     app.add_handler(CommandHandler("dashboard", dashboard))
     app.add_handler(CommandHandler("settings", settings))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    # Обработчики колбэков
     app.add_handler(CallbackQueryHandler(button_handler, pattern="^(history_|history_eth|history_bsc|history_solana)$"))
     app.add_handler(CallbackQueryHandler(settings_button, pattern="^(set_|reset_settings).*"))
