@@ -121,7 +121,6 @@ async def _get_alchemy_token_balances(session, address: str) -> List[Dict]:
                 data = await resp.json()
                 result = data.get("result", {})
                 tokens = result.get("tokenBalances", [])
-                # Оставляем только ненулевые балансы
                 return [t for t in tokens if t.get("tokenBalance", "0x0") != "0x0000000000000000000000000000000000000000000000000000000000000000"]
     except Exception as e:
         logger.warning(f"Alchemy token balances failed: {e}")
@@ -144,7 +143,7 @@ async def _get_decimals(session, contract_address: str, rpc_url: str) -> int:
                     return int(result, 16)
     except:
         pass
-    return 18  # fallback
+    return 18
 
 async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = context.user_data['address']
@@ -157,8 +156,8 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
-            # Ethereum через Moralis
-            eth_tokens = await moralis.get_balances(session, address, chain="eth")
+            # Ethereum через Moralis (основной список)
+            eth_tokens_moralis = await moralis.get_balances(session, address, chain="eth")
             # BSC через Ankr
             ankr_data = await ankr.get_multichain_balances(session, address, chains=["bsc"])
             bsc_assets = ankr_data.get("assets", []) if ankr_data else []
@@ -166,9 +165,6 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines = [f"💰 <b>Баланс кошелька</b>\n<code>{address}</code>"]
 
             # --- Ethereum ---
-            eth_total = 0.0
-            eth_lines = []
-            # Каскад цен для EVM
             eth_conf = NETWORKS["ethereum"]
             rpc_url = eth_conf["rpc_url"]
             eth_web3 = EVMWeb3Client(rpc_url, eth_conf["chain_id"], eth_conf["weth"],
@@ -176,74 +172,62 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                      stable=eth_conf.get("stablecoins", [""])[0])
             evm_cascade = EVMPriceCascade(eth_web3)
 
-            # Множество адресов контрактов из Moralis (для проверки пропавших)
-            moralis_contracts = set()
-            for t in eth_tokens:
+            # Собираем все токены в единый список (словарь: ключ = адрес контракта)
+            all_eth_tokens = {}  # contract_address -> {symbol, balance, usd_val}
+
+            # 1. Токены из Moralis
+            for t in eth_tokens_moralis:
                 contract = (t.get("contract_address") or "").lower()
-                if contract and contract != "0x0000000000000000000000000000000000000000":
-                    moralis_contracts.add(contract)
-
-            # Получаем полный список токенов через Alchemy
-            alchemy_tokens = await _get_alchemy_token_balances(session, address)
-            missing_tokens = []  # токены, которых нет в Moralis
-
-            for at in alchemy_tokens:
-                contract_addr = at.get("contractAddress", "").lower()
-                if not contract_addr or contract_addr == "0x0000000000000000000000000000000000000000":
+                if not contract or contract == "0x0000000000000000000000000000000000000000":
                     continue
-                if contract_addr in moralis_contracts:
-                    continue
-                # Пропавший токен
-                raw_balance = int(at.get("tokenBalance", "0x0"), 16)
-                if raw_balance == 0:
-                    continue
-                symbol = await TokenInfoService.get_symbol(session, contract_addr, rpc_url)
-                decimals = await _get_decimals(session, contract_addr, rpc_url)
-                balance = raw_balance / (10 ** decimals)
-                # Получаем цену
-                price = await evm_cascade.get_price(session, contract_addr, "ethereum", 0.0)
-                usd_val = balance * price if price else 0.0
-                missing_tokens.append({
-                    "symbol": symbol,
-                    "balance": balance,
-                    "usd_val": usd_val,
-                    "contract": contract_addr
-                })
-
-            # Обрабатываем Moralis токены
-            for t in eth_tokens:
                 symbol = t.get("symbol", "?")
                 balance = float(t.get("balance_formatted", 0))
                 usd_val = float(t.get("usd_value", 0))
-                contract = t.get("contract_address", "")
                 if usd_val == 0.0:
                     price = await evm_cascade.get_price(session, contract, "ethereum", 0.0)
                     if price:
                         usd_val = balance * price
-                if usd_val > 0 and usd_val < MIN_USD_VALUE:
-                    continue
-                if usd_val > 0:
-                    eth_total += usd_val
-                    display = f"≈ ${usd_val:,.2f}"
-                else:
-                    display = "?"
-                if contract and contract.lower() != "0x0000000000000000000000000000000000000000":
-                    link = f"https://dexscreener.com/ethereum/{contract}"
-                    eth_lines.append(f"• <a href='{link}'>{symbol}</a>: {balance:.4f} ({display})")
-                else:
-                    eth_lines.append(f"• {symbol}: {balance:.4f} ({display})")
+                all_eth_tokens[contract] = {"symbol": symbol, "balance": balance, "usd_val": usd_val}
 
-            # Добавляем пропавшие токены
-            for mt in missing_tokens:
-                if mt["usd_val"] > 0 and mt["usd_val"] < MIN_USD_VALUE:
+            # 2. Alchemy (дополняет пропущенные Moralis токены, фильтрует спам)
+            alchemy_tokens = await _get_alchemy_token_balances(session, address)
+            for at in alchemy_tokens:
+                contract = at.get("contractAddress", "").lower()
+                if not contract or contract == "0x0000000000000000000000000000000000000000":
                     continue
-                if mt["usd_val"] > 0:
-                    eth_total += mt["usd_val"]
-                    display = f"≈ ${mt['usd_val']:,.2f}"
+                # Пропускаем уже известные Moralis
+                if contract in all_eth_tokens:
+                    continue
+                raw_balance = int(at.get("tokenBalance", "0x0"), 16)
+                if raw_balance == 0:
+                    continue
+                symbol = await TokenInfoService.get_symbol(session, contract, rpc_url)
+                # Фильтр спама: LP-токены (начинаются с UNI-V2) и токены с балансом ровно 1 (скам)
+                if symbol.startswith("UNI-V2") or symbol == "PEPEE" or (raw_balance == 10**18 and symbol == "?"):
+                    continue
+                decimals = await _get_decimals(session, contract, rpc_url)
+                balance = raw_balance / (10 ** decimals)
+                price = await evm_cascade.get_price(session, contract, "ethereum", 0.0)
+                usd_val = balance * price if price else 0.0
+                all_eth_tokens[contract] = {"symbol": symbol, "balance": balance, "usd_val": usd_val}
+
+            # Сортируем: сначала с известной ценой (по убыванию), потом без цены
+            eth_sorted = sorted(all_eth_tokens.items(),
+                               key=lambda item: (item[1]["usd_val"] if item[1]["usd_val"] > 0 else -1),
+                               reverse=True)
+
+            eth_total = 0.0
+            eth_lines = []
+            for contract, data in eth_sorted:
+                if data["usd_val"] > 0 and data["usd_val"] < MIN_USD_VALUE:
+                    continue
+                if data["usd_val"] > 0:
+                    eth_total += data["usd_val"]
+                    display = f"≈ ${data['usd_val']:,.2f}"
                 else:
                     display = "?"
-                link = f"https://dexscreener.com/ethereum/{mt['contract']}"
-                eth_lines.append(f"• <a href='{link}'>{mt['symbol']}</a>: {mt['balance']:.4f} ({display})")
+                link = f"https://dexscreener.com/ethereum/{contract}"
+                eth_lines.append(f"• <a href='{link}'>{data['symbol']}</a>: {data['balance']:.4f} ({display})")
 
             lines.append("\n⛓️ <b>Ethereum</b>")
             lines.append(f"Общая стоимость в сети: ≈ ${eth_total:,.2f}")
