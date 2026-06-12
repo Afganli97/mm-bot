@@ -9,6 +9,7 @@ from typing import List, Dict, Set
 import aiohttp
 from bot.api_clients import HeliusClient
 from bot.token_filter import is_excluded
+from bot.blacklist import is_blacklisted
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,8 @@ class SolanaTraversal:
         queue = deque([(self.start_address, 0)])
         self.visited.add(self.start_address)
         self.total_addresses = 1
+        
+        logger.info(f"Начало обхода Solana для {self.start_address} | Глубина: {self.max_depth}")
 
         while queue and self.total_addresses < 2000 and len(self.unique_tokens) < self.max_tokens:
             addr, depth = queue.popleft()
@@ -72,21 +75,21 @@ class SolanaTraversal:
                             self.unique_tokens.add(mint)
                             logger.info(f"Solana покупка: {mint} у {addr}")
 
-                if depth + 1 < self.max_depth:
+                # Ищем переводы на другие адреса (наращиваем граф связей)
+                if depth + 1 <= self.max_depth:
                     for instr in tx_data.get("transaction", {}).get("message", {}).get("instructions", []):
                         if not isinstance(instr, dict):
                             continue
-                        if instr.get("parsed", {}).get("type") == "transfer":
+                        instr_type = instr.get("parsed", {}).get("type")
+                        if instr_type in ("transfer", "transferChecked"):
                             dest = instr["parsed"]["info"].get("destination")
+                            
+                            # Проверка адреса по черному списку бирж и мостов!
                             if dest and dest not in self.visited and dest != addr:
-                                self.visited.add(dest)
-                                queue.append((dest, depth + 1))
-                                self.total_addresses += 1
-                                if self.total_addresses >= 2000:
-                                    break
-                        elif instr.get("parsed", {}).get("type") == "transferChecked":
-                            dest = instr["parsed"]["info"].get("destination")
-                            if dest and dest not in self.visited and dest != addr:
+                                if is_blacklisted(dest, is_solana=True):
+                                    logger.debug(f"Solana: Адрес {dest} проигнорирован (в черном списке CEX)")
+                                    continue
+                                
                                 self.visited.add(dest)
                                 queue.append((dest, depth + 1))
                                 self.total_addresses += 1
