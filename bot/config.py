@@ -34,11 +34,10 @@ HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELI
 # Birdeye
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
 
-# ---------- Параметры анализа ----------
+# ---------- Параметры анализа по умолчанию ----------
 DEFAULT_MAX_DEPTH = 3
 DEFAULT_MAX_BRANCHES = 50
 DEFAULT_LOOKBACK_DAYS = 30
-DEFAULT_MIN_TRANSFER_VALUE_ETH = 0.001
 DEFAULT_MAX_ADDRESSES = 2000
 DEFAULT_MAX_FOUND_TOKENS = 100
 
@@ -70,7 +69,6 @@ NETWORKS = {
             "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",  # USDC
         ],
         "rpc_url": _evm_rpc_url(1),
-        "min_transfer_value_native": 0.001,
     },
     "bsc": {
         "name": "BSC",
@@ -86,7 +84,6 @@ NETWORKS = {
             "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",  # USDC
         ],
         "rpc_url": _evm_rpc_url(56),
-        "min_transfer_value_native": 0.001,
     },
     "solana": {
         "name": "Solana",
@@ -103,7 +100,6 @@ NETWORKS = {
             "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
         ],
         "rpc_url": HELIUS_URL or "https://api.mainnet-beta.solana.com",
-        "min_transfer_value_native": 0.001,
     }
 }
 
