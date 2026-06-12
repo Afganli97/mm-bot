@@ -172,8 +172,8 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                      stable=eth_conf.get("stablecoins", [""])[0])
             evm_cascade = EVMPriceCascade(eth_web3)
 
-            # Собираем все токены в единый список (словарь: ключ = адрес контракта)
-            all_eth_tokens = {}  # contract_address -> {symbol, balance, usd_val}
+            # Единый словарь токенов (contract_address -> {symbol, balance, usd_val})
+            all_eth_tokens = {}
 
             # 1. Токены из Moralis
             for t in eth_tokens_moralis:
@@ -189,20 +189,19 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         usd_val = balance * price
                 all_eth_tokens[contract] = {"symbol": symbol, "balance": balance, "usd_val": usd_val}
 
-            # 2. Alchemy (дополняет пропущенные Moralis токены, фильтрует спам)
+            # 2. Alchemy (дополняет пропущенные Moralis токены, фильтрует LP и спам)
             alchemy_tokens = await _get_alchemy_token_balances(session, address)
             for at in alchemy_tokens:
                 contract = at.get("contractAddress", "").lower()
                 if not contract or contract == "0x0000000000000000000000000000000000000000":
                     continue
-                # Пропускаем уже известные Moralis
                 if contract in all_eth_tokens:
                     continue
                 raw_balance = int(at.get("tokenBalance", "0x0"), 16)
                 if raw_balance == 0:
                     continue
                 symbol = await TokenInfoService.get_symbol(session, contract, rpc_url)
-                # Фильтр спама: LP-токены (начинаются с UNI-V2) и токены с балансом ровно 1 (скам)
+                # Фильтр LP‑токенов и очевидного спама
                 if symbol.startswith("UNI-V2") or symbol == "PEPEE" or (raw_balance == 10**18 and symbol == "?"):
                     continue
                 decimals = await _get_decimals(session, contract, rpc_url)
@@ -211,7 +210,7 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 usd_val = balance * price if price else 0.0
                 all_eth_tokens[contract] = {"symbol": symbol, "balance": balance, "usd_val": usd_val}
 
-            # Сортируем: сначала с известной ценой (по убыванию), потом без цены
+            # Сортируем: с ценой (по убыванию), затем без цены
             eth_sorted = sorted(all_eth_tokens.items(),
                                key=lambda item: (item[1]["usd_val"] if item[1]["usd_val"] > 0 else -1),
                                reverse=True)
@@ -555,7 +554,6 @@ def register_handlers(app):
     app.add_handler(CommandHandler("dashboard", dashboard))
     app.add_handler(CommandHandler("settings", settings))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    # Явный обработчик для history_evm, чтобы гарантировать вызов
     app.add_handler(CallbackQueryHandler(history_evm_handler, pattern='history_evm'))
     app.add_handler(CallbackQueryHandler(button_handler, pattern="^(history_eth|history_bsc|history_solana)$"))
     app.add_handler(CallbackQueryHandler(settings_button, pattern="^(set_|reset_settings).*"))
