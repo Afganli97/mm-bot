@@ -145,6 +145,19 @@ async def _get_decimals(session, contract_address: str, rpc_url: str) -> int:
         pass
     return 18
 
+def _is_spam_token(symbol: str, raw_balance: int, decimals: int) -> bool:
+    """
+    Определяет, является ли токен спамом.
+    - LP-токены (начинающиеся с UNI-V2) всегда считаются служебными и исключаются.
+    - Токены с балансом ровно 0 или 1 в минимальных единицах (например, 1 wei) – вероятный спам.
+    """
+    if symbol.startswith("UNI-V2"):
+        return True
+    # raw_balance – целое число в минимальных единицах (wei)
+    if raw_balance <= 1:
+        return True
+    return False
+
 async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = context.user_data['address']
     moralis: MoralisClient = context.application.bot_data.get('moralis')
@@ -156,9 +169,9 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
-            # Ethereum через Moralis (основной список)
+            # 1. Moralis (основной список)
             eth_tokens_moralis = await moralis.get_balances(session, address, chain="eth")
-            # BSC через Ankr
+            # 2. BSC через Ankr
             ankr_data = await ankr.get_multichain_balances(session, address, chains=["bsc"])
             bsc_assets = ankr_data.get("assets", []) if ankr_data else []
 
@@ -172,10 +185,10 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                      stable=eth_conf.get("stablecoins", [""])[0])
             evm_cascade = EVMPriceCascade(eth_web3)
 
-            # Единый словарь токенов (contract_address -> {symbol, balance, usd_val})
+            # Единый словарь токенов: contract_address -> {symbol, balance, usd_val}
             all_eth_tokens = {}
 
-            # 1. Токены из Moralis
+            # Заполняем из Moralis
             for t in eth_tokens_moralis:
                 contract = (t.get("contract_address") or "").lower()
                 if not contract or contract == "0x0000000000000000000000000000000000000000":
@@ -183,34 +196,38 @@ async def show_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 symbol = t.get("symbol", "?")
                 balance = float(t.get("balance_formatted", 0))
                 usd_val = float(t.get("usd_value", 0))
-                if usd_val == 0.0:
-                    price = await evm_cascade.get_price(session, contract, "ethereum", 0.0)
-                    if price:
-                        usd_val = balance * price
+                # Не применяем is_spam к Moralis, т.к. Moralis уже фильтрует спам через exclude_spam=true
                 all_eth_tokens[contract] = {"symbol": symbol, "balance": balance, "usd_val": usd_val}
 
-            # 2. Alchemy (дополняет пропущенные Moralis токены, фильтрует LP и спам)
+            # 3. Alchemy – дополняем недостающие токены, фильтруя спам
             alchemy_tokens = await _get_alchemy_token_balances(session, address)
             for at in alchemy_tokens:
                 contract = at.get("contractAddress", "").lower()
                 if not contract or contract == "0x0000000000000000000000000000000000000000":
                     continue
-                if contract in all_eth_tokens:
+                if contract in all_eth_tokens:          # уже есть из Moralis – пропускаем
                     continue
                 raw_balance = int(at.get("tokenBalance", "0x0"), 16)
                 if raw_balance == 0:
                     continue
                 symbol = await TokenInfoService.get_symbol(session, contract, rpc_url)
-                # Фильтр LP‑токенов и очевидного спама
-                if symbol.startswith("UNI-V2") or symbol == "PEPEE" or (raw_balance == 10**18 and symbol == "?"):
-                    continue
                 decimals = await _get_decimals(session, contract, rpc_url)
+                # Фильтрация спама по универсальному правилу
+                if _is_spam_token(symbol, raw_balance, decimals):
+                    continue
                 balance = raw_balance / (10 ** decimals)
                 price = await evm_cascade.get_price(session, contract, "ethereum", 0.0)
                 usd_val = balance * price if price else 0.0
                 all_eth_tokens[contract] = {"symbol": symbol, "balance": balance, "usd_val": usd_val}
 
-            # Сортируем: с ценой (по убыванию), затем без цены
+            # 4. Для всех токенов, где цена 0 – пробуем каскад
+            for contract, data in all_eth_tokens.items():
+                if data["usd_val"] == 0.0:
+                    price = await evm_cascade.get_price(session, contract, "ethereum", 0.0)
+                    if price:
+                        data["usd_val"] = data["balance"] * price
+
+            # 5. Сортируем: с ценой (по убыванию), затем без цены
             eth_sorted = sorted(all_eth_tokens.items(),
                                key=lambda item: (item[1]["usd_val"] if item[1]["usd_val"] > 0 else -1),
                                reverse=True)
