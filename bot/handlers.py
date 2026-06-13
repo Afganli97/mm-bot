@@ -324,9 +324,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"⏳ Запущен анализ истории покупок в сети {network_name}. Строю граф связей...")
         await run_evm_history(query, context, chain)
 
+
 async def run_evm_history(query, context, chain: str):
     address = context.user_data['address']
     user_id = query.from_user.id
+    
     settings_dict = get_user_settings_dict(user_id)
     max_depth = int(settings_dict.get('max_depth', DEFAULT_MAX_DEPTH))
     lookback_days = int(settings_dict.get('lookback_days', DEFAULT_LOOKBACK_DAYS))
@@ -338,11 +340,17 @@ async def run_evm_history(query, context, chain: str):
             conf = NETWORKS[chain]
             web3 = EVMWeb3Client(conf["rpc_url"], conf["chain_id"], conf["weth"], router=conf.get("dex_routers", [""])[0], stable=conf.get("stablecoins", [""])[0])
             
-            # ВАЖНО: Etherscan V2 Explorer передается всем EVM сетям для корректного поиска транзакций
-            explorer = EVMExplorerClient(conf["chain_id"], conf["weth"])
-            
-            if chain == "ethereum": network = EthereumNetwork(conf, session, explorer, web3)
-            else: network = BscNetwork(conf, session, explorer, web3)
+            # ФАБРИКА СЕТЕЙ: Разделяем потоки Ethereum (V2 API) и BSC (RPC Альтернатива)
+            if chain == "ethereum":
+                # Ethereum работает через Etherscan V2
+                explorer = EVMExplorerClient(conf["chain_id"], conf["weth"])
+                network = EthereumNetwork(conf, session, explorer, web3)
+            elif chain == "bsc":
+                # BSC работает через бесплатный RPC (без Etherscan)
+                network = BscNetwork(conf, session, web3)
+            else:
+                await query.edit_message_text(f"❌ Сеть {chain} пока не поддерживается для истории.")
+                return
 
             traversal = GraphTraversal(session, address, network, max_tokens=max_tokens, lookback_days=lookback_days, max_depth=max_depth)
             found = await traversal.run()
@@ -354,10 +362,14 @@ async def run_evm_history(query, context, chain: str):
             unique = {item['token']: item for item in found}
             token_lines = [f"• <a href='https://dexscreener.com/{chain}/{addr}'>{data['symbol']}</a> (<code>{addr}</code>)" for addr, data in unique.items()]
             report = f"✅ <b>История покупок {conf['name']}</b>\nНайдено токенов: {len(unique)} (глубина: {max_depth})\n\n" + "\n".join(token_lines)
+            
+            # Импорт функции отправки длинных сообщений (убедитесь, что она есть в файле)
             await _send_long_message(context.bot, query.message.chat_id, report, parse_mode="HTML")
+            
     except Exception as e:
         logger.exception("Ошибка истории EVM")
         await query.edit_message_text(f"❌ Ошибка во время обхода графа: {e}")
+
 
 async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
     names = {}
