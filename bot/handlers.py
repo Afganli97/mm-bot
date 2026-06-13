@@ -52,11 +52,9 @@ def is_solana_address(addr: str) -> bool:
 def _check_access(update: Update) -> bool:
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS:
-        logger.info(f"Попытка доступа от непривилегированного пользователя {user_id}")
         return False
     return True
 
-# Стандартные команды
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
     await update.message.reply_text(
@@ -89,14 +87,12 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += "\n<i>Лимиты автоматически обнуляются в 00:00 UTC.</i>"
     await update.message.reply_text(msg, parse_mode="HTML")
 
-# Основной обработчик: Разделение логики валидации адресов
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
     if context.user_data.get('awaiting_setting'):
         await setting_value_input(update, context)
         return
     text = update.message.text.strip()
-    session = _get_global_session(context)
 
     if is_solana_address(text):
         context.user_data['address'] = text
@@ -112,7 +108,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Формат адреса не распознан. Отправьте валидный адрес EVM или Solana.")
         return
 
-# Вспомогательные функции для токенов
 async def _get_alchemy_token_balances(session, address: str) -> List[Dict]:
     alchemy_url = f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
     payload = {"jsonrpc": "2.0", "method": "alchemy_getTokenBalances", "params": [address], "id": 1}
@@ -121,8 +116,7 @@ async def _get_alchemy_token_balances(session, address: str) -> List[Dict]:
             if resp.status == 200:
                 data = await resp.json()
                 return [t for t in data.get("result", {}).get("tokenBalances", []) if t.get("tokenBalance", "0x0") != "0x0000000000000000000000000000000000000000000000000000000000000000"]
-    except Exception as e:
-        logger.warning(f"Alchemy token balances failed: {e}")
+    except: pass
     return []
 
 async def _get_decimals(session, contract_address: str, rpc_url: str) -> int:
@@ -130,10 +124,8 @@ async def _get_decimals(session, contract_address: str, rpc_url: str) -> int:
     try:
         async with session.post(rpc_url, json=payload, timeout=10) as resp:
             if resp.status == 200:
-                data = await resp.json()
-                result = data.get("result")
-                if result and result != "0x":
-                    return int(result, 16)
+                result = (await resp.json()).get("result")
+                if result and result != "0x": return int(result, 16)
     except: pass
     return 18
 
@@ -142,7 +134,6 @@ def _is_spam_token(raw_balance: int, decimals: int) -> bool:
     if raw_balance == 10 ** decimals: return True
     return False
 
-# Сбор балансов для всех поддерживаемых EVM-сетей
 async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = context.user_data['address']
     moralis: MoralisClient = context.application.bot_data.get('moralis')
@@ -155,7 +146,6 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
-            
             lines = [f"💰 <b>Мультичейн EVM Балансы</b>\n<code>{address}</code>\n"]
             total_usd_portfolio = 0.0
 
@@ -163,29 +153,36 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
             if "ethereum" in NETWORKS and moralis:
                 eth_conf = NETWORKS["ethereum"]
                 eth_web3 = EVMWeb3Client(eth_conf["rpc_url"], eth_conf["chain_id"], eth_conf["weth"],
-                                         router=eth_conf.get("dex_routers", [""])[0],
-                                         stable=eth_conf.get("stablecoins", [""])[0])
+                                         router=eth_conf.get("dex_routers", [""])[0], stable=eth_conf.get("stablecoins", [""])[0])
                 evm_cascade = EVMPriceCascade(eth_web3)
 
                 eth_tokens_moralis = await moralis.get_balances(session, address, chain="eth")
                 all_eth_tokens = {}
 
+                # 1.1 Добавление нативного ETH баланса
+                native_balance = await eth_web3.get_balance(session, address)
+                if native_balance > 0:
+                    eth_price = await evm_cascade.get_price(session, eth_conf["weth"], "ethereum", 0.0) or 0.0
+                    all_eth_tokens["native"] = {
+                        "symbol": eth_conf["native_symbol"], "balance": native_balance,
+                        "usd_val": native_balance * eth_price, "raw_balance": int(native_balance * 1e18),
+                        "decimals": 18, "is_native": True
+                    }
+
+                # 1.2 Токены с Moralis
                 for t in eth_tokens_moralis:
                     contract = (t.get("contract_address") or "").lower()
                     if not contract or contract == "0x0000000000000000000000000000000000000000": continue
                     balance = float(t.get("balance_formatted", 0))
-                    decimals = 18
                     all_eth_tokens[contract] = {
-                        "symbol": t.get("symbol", "?"),
-                        "balance": balance,
-                        "usd_val": float(t.get("usd_value", 0)),
-                        "raw_balance": int(balance * (10 ** decimals)),
-                        "decimals": decimals
+                        "symbol": str(t.get("symbol", "?")).strip(), "balance": balance,
+                        "usd_val": float(t.get("usd_value", 0)), "raw_balance": int(balance * 1e18),
+                        "decimals": 18, "is_native": False
                     }
 
+                # 1.3 Токены с Alchemy (мелкокапы)
                 if ALCHEMY_API_KEY:
-                    alchemy_tokens = await _get_alchemy_token_balances(session, address)
-                    for at in alchemy_tokens:
+                    for at in await _get_alchemy_token_balances(session, address):
                         contract = at.get("contractAddress", "").lower()
                         if not contract or contract in all_eth_tokens or contract == "0x0000000000000000000000000000000000000000": continue
                         raw_balance = int(at.get("tokenBalance", "0x0"), 16)
@@ -194,18 +191,17 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
                         decimals = await _get_decimals(session, contract, eth_conf["rpc_url"])
                         all_eth_tokens[contract] = {
                             "symbol": symbol, "balance": raw_balance / (10 ** decimals),
-                            "usd_val": 0.0, "raw_balance": raw_balance, "decimals": decimals
+                            "usd_val": 0.0, "raw_balance": raw_balance, "decimals": decimals, "is_native": False
                         }
 
                 filtered_eth = {k: v for k, v in all_eth_tokens.items() if not _is_spam_token(v["raw_balance"], v["decimals"])}
                 
                 for contract, data in filtered_eth.items():
-                    if data["usd_val"] == 0.0:
+                    if data["usd_val"] == 0.0 and not data["is_native"]:
                         price = await evm_cascade.get_price(session, contract, "ethereum", 0.0)
                         if price: data["usd_val"] = data["balance"] * price
 
                 eth_sorted = sorted(filtered_eth.items(), key=lambda item: (item[1]["usd_val"] if item[1]["usd_val"] > 0 else -1), reverse=True)
-                
                 eth_total = sum(data["usd_val"] for _, data in eth_sorted if data["usd_val"] >= MIN_USD_VALUE)
                 total_usd_portfolio += eth_total
 
@@ -214,31 +210,26 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
                 for contract, data in eth_sorted:
                     if data["usd_val"] > 0 and data["usd_val"] < MIN_USD_VALUE: continue
                     display = f"≈ ${data['usd_val']:,.2f}" if data["usd_val"] > 0 else "?"
-                    lines.append(f"• <a href='https://dexscreener.com/ethereum/{contract}'>{data['symbol']}</a>: {data['balance']:.4f} ({display})")
+                    link = f"https://dexscreener.com/ethereum/{eth_conf['weth']}" if data["is_native"] else f"https://dexscreener.com/ethereum/{contract}"
+                    lines.append(f"• <a href='{link}'>{data['symbol']}</a>: {data['balance']:.4f} ({display})")
                 lines.append("")
 
             # --- 2. Обработка BSC и других EVM сетей через Ankr ---
             other_chains = [key for key in NETWORKS if key not in ("ethereum", "solana")]
             if other_chains:
                 ankr_data = await ankr.get_multichain_balances(session, address, chains=other_chains)
-                assets = ankr_data.get("assets", []) if ankr_data else []
-                
-                # Группируем активы по сетям
                 grouped_assets = {chain: [] for chain in other_chains}
-                for a in assets:
-                    chain = a.get("blockchain", "")
-                    if chain in grouped_assets:
-                        grouped_assets[chain].append(a)
+                for a in (ankr_data.get("assets", []) if ankr_data else []):
+                    if a.get("blockchain") in grouped_assets: grouped_assets[a["blockchain"]].append(a)
 
                 for chain in other_chains:
-                    chain_assets = grouped_assets[chain]
                     chain_name = NETWORKS[chain]["name"]
                     chain_total = 0.0
                     chain_lines = []
 
-                    for a in chain_assets:
+                    for a in grouped_assets[chain]:
                         usd_val = float(a.get("balanceUsd", 0))
-                        sym = a.get("tokenSymbol", "?")
+                        sym = str(a.get("tokenSymbol", "?")).strip()
                         if usd_val < MIN_USD_VALUE and sym != NETWORKS[chain]["native_symbol"]: continue
                         
                         chain_total += usd_val
@@ -246,8 +237,11 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
                         display = f"≈ ${usd_val:,.2f}" if usd_val > 0 else "?"
                         contract = a.get("contractAddress", "")
                         
+                        # Выдача правильного линка для нативных и обычных токенов
                         if contract and contract.lower() != "0x0000000000000000000000000000000000000000":
                             chain_lines.append(f"• <a href='https://dexscreener.com/{chain}/{contract}'>{sym}</a>: {bal:.4f} ({display})")
+                        elif sym == NETWORKS[chain]["native_symbol"] and NETWORKS[chain].get("weth"):
+                            chain_lines.append(f"• <a href='https://dexscreener.com/{chain}/{NETWORKS[chain]['weth']}'>{sym}</a>: {bal:.4f} ({display})")
                         else:
                             chain_lines.append(f"• {sym}: {bal:.4f} ({display})")
 
@@ -258,11 +252,8 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
                     lines.append("")
 
             lines.insert(2, f"💼 <b>Общий баланс портфеля: ≈ ${total_usd_portfolio:,.2f}</b>\n")
-            
-            text = "\n".join(lines).strip()
-            await _send_long_message(context.bot, update.effective_chat.id, text, parse_mode="HTML")
+            await _send_long_message(context.bot, update.effective_chat.id, "\n".join(lines).strip(), parse_mode="HTML")
 
-            # Кнопка для старта истории по EVM сетям (Открывает меню выбора)
             keyboard = [[InlineKeyboardButton("🔎 Найти историю покупок", callback_data="history_evm_menu")]]
             await update.message.reply_text("Анализ завершен. Желаете найти историю ранних покупок ММ?", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -274,16 +265,12 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
     address = context.user_data['address']
     helius: HeliusClient = context.application.bot_data.get('helius')
     cascade: CascadePriceFetcher = context.application.bot_data.get('cascade')
-    if not helius or not cascade:
-        await update.message.reply_text("❌ Helius или каскад цен не настроен.")
-        return
+    if not helius or not cascade: return
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
             data = await helius.get_wallet_balances(session, address)
-            if not data:
-                await update.message.reply_text("❌ Не удалось получить баланс Solana.")
-                return
+            if not data: return
             balances = data.get("balances", [])
             lines = [f"💰 <b>Баланс Solana</b>\n<code>{address}</code>"]
 
@@ -292,7 +279,7 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             total_usd = 0.0
             for tok in balances:
-                symbol = tok.get("symbol") or tok.get("name", "?")
+                symbol = str(tok.get("symbol") or tok.get("name", "?")).strip()
                 bal = float(tok.get("balance", 0))
                 mint = tok.get("mint")
                 usd_val = tok.get("usdValue")
@@ -300,7 +287,6 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
                 else: usd_val = bal * additional_prices.get(mint) if additional_prices.get(mint) else None
 
                 if usd_val is not None and usd_val < MIN_USD_VALUE: continue
-
                 if usd_val is not None:
                     total_usd += usd_val
                     price_display = f"≈ ${usd_val:,.2f}"
@@ -318,29 +304,17 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     except Exception as e:
         logger.exception("Ошибка получения Solana баланса")
-        await update.message.reply_text(f"❌ Ошибка: {e}")
 
-
-# --- Интерактивный выбор сети для истории (Только EVM) ---
 async def history_evm_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
-    keyboard = []
-    for chain_key, conf in NETWORKS.items():
-        if chain_key == "solana": continue
-        keyboard.append([InlineKeyboardButton(conf["name"], callback_data=f"history_{chain_key}")])
-        
-    await query.edit_message_text(
-        "Выберите EVM сеть, в которой необходимо проанализировать историю покупок MM:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    keyboard = [[InlineKeyboardButton(conf["name"], callback_data=f"history_{chain_key}")] for chain_key, conf in NETWORKS.items() if chain_key != "solana"]
+    await query.edit_message_text("Выберите EVM сеть, в которой необходимо проанализировать историю покупок MM:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-
     if data == "history_solana":
         await query.edit_message_text("⏳ Запущен анализ истории покупок Solana. Обхожу связанные адреса...")
         await run_solana_history(query, context)
@@ -353,8 +327,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def run_evm_history(query, context, chain: str):
     address = context.user_data['address']
     user_id = query.from_user.id
-    
-    # Применяем настройки пользователя из БД
     settings_dict = get_user_settings_dict(user_id)
     max_depth = int(settings_dict.get('max_depth', DEFAULT_MAX_DEPTH))
     lookback_days = int(settings_dict.get('lookback_days', DEFAULT_LOOKBACK_DAYS))
@@ -364,17 +336,14 @@ async def run_evm_history(query, context, chain: str):
         from aiohttp import ClientSession
         async with ClientSession() as session:
             conf = NETWORKS[chain]
-            web3 = EVMWeb3Client(conf["rpc_url"], conf["chain_id"], conf["weth"],
-                                 router=conf.get("dex_routers", [""])[0],
-                                 stable=conf.get("stablecoins", [""])[0])
+            web3 = EVMWeb3Client(conf["rpc_url"], conf["chain_id"], conf["weth"], router=conf.get("dex_routers", [""])[0], stable=conf.get("stablecoins", [""])[0])
             
-            if chain == "ethereum":
-                explorer = EVMExplorerClient(conf["chain_id"], conf["weth"])
-                network = EthereumNetwork(conf, session, explorer, web3)
-            else:
-                network = BscNetwork(conf, session, web3)
+            # ВАЖНО: Etherscan V2 Explorer передается всем EVM сетям для корректного поиска транзакций
+            explorer = EVMExplorerClient(conf["chain_id"], conf["weth"])
+            
+            if chain == "ethereum": network = EthereumNetwork(conf, session, explorer, web3)
+            else: network = BscNetwork(conf, session, explorer, web3)
 
-            # Передаем настройки в алгоритм
             traversal = GraphTraversal(session, address, network, max_tokens=max_tokens, lookback_days=lookback_days, max_depth=max_depth)
             found = await traversal.run()
             
@@ -390,19 +359,15 @@ async def run_evm_history(query, context, chain: str):
         logger.exception("Ошибка истории EVM")
         await query.edit_message_text(f"❌ Ошибка во время обхода графа: {e}")
 
-# Каскадное получение имён токенов Solana
 async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
     names = {}
     if not mints: return names
     try:
-        ids = ",".join(mints[:100])
-        async with session.get(f"https://price.jup.ag/v4/price?ids={ids}", timeout=10) as resp:
+        async with session.get(f"https://price.jup.ag/v4/price?ids={','.join(mints[:100])}", timeout=10) as resp:
             if resp.status == 200:
-                data = await resp.json()
-                for mint, info in data.get("data", {}).items():
+                for mint, info in (await resp.json()).get("data", {}).items():
                     if isinstance(info, dict): names[mint] = info.get("name") or info.get("symbol") or "?"
     except: pass
-    
     remaining = [m for m in mints if m not in names]
     if not remaining: return names
     
@@ -411,11 +376,8 @@ async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
             try:
                 async with session.get(f"https://public-api.birdeye.so/defi/token_overview?address={mint}&x-chain=solana", headers={"X-API-KEY": BIRDEYE_API_KEY}, timeout=5) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        name = data.get("data", {}).get("name") or data.get("data", {}).get("symbol")
-                        if name:
-                            names[mint] = name
-                            remaining.remove(mint)
+                        name = (await resp.json()).get("data", {}).get("name") or (await resp.json()).get("data", {}).get("symbol")
+                        if name: names[mint] = name; remaining.remove(mint)
             except: pass
             await asyncio.sleep(0.3)
             
@@ -426,9 +388,7 @@ async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
                     pairs = (await resp.json()).get("pairs")
                     if pairs:
                         name = pairs[0].get("baseToken", {}).get("name") or pairs[0].get("baseToken", {}).get("symbol")
-                        if name:
-                            names[mint] = name
-                            remaining.remove(mint)
+                        if name: names[mint] = name; remaining.remove(mint)
         except: pass
         await asyncio.sleep(0.3)
         
@@ -438,58 +398,44 @@ async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
 async def run_solana_history(query, context):
     address = context.user_data['address']
     user_id = query.from_user.id
-    
-    # Применяем настройки
     settings_dict = get_user_settings_dict(user_id)
     max_depth = int(settings_dict.get('max_depth', DEFAULT_MAX_DEPTH))
     lookback_days = int(settings_dict.get('lookback_days', DEFAULT_LOOKBACK_DAYS))
     max_tokens = int(settings_dict.get('max_tokens', DEFAULT_MAX_FOUND_TOKENS))
 
     helius: HeliusClient = context.application.bot_data.get('helius')
-    if not helius:
-        await query.edit_message_text("❌ Helius не настроен.")
-        return
+    if not helius: return
     try:
         from aiohttp import ClientSession
         async with ClientSession() as session:
             traversal = SolanaTraversal(session, address, helius, max_depth=max_depth, max_tokens=max_tokens, lookback_days=lookback_days)
             found = await traversal.run()
-            
             if not found:
                 await query.edit_message_text("✅ Анализ завершён. Ранних покупок токенов по связям ММ не найдено.")
                 return
-            
             unique_mints = list({item['token'] for item in found})
             names = await get_token_names_cascade(session, unique_mints)
-            
             token_lines = [f"• <a href='https://dexscreener.com/solana/{item['token']}'>{names.get(item['token'], '?')}</a> (<code>{item['token']}</code>)" for item in found]
             report = f"✅ <b>История покупок Solana</b>\nНайдено токенов: {len(found)} (глубина: {max_depth})\n\n" + "\n".join(token_lines)
             await _send_long_message(context.bot, query.message.chat_id, report, parse_mode="HTML")
     except Exception as e:
         logger.exception("Ошибка истории Solana")
-        await query.edit_message_text(f"❌ Ошибка во время обхода: {e}")
 
 async def _send_long_message(bot, chat_id, text, parse_mode="HTML"):
-    if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
-        await bot.send_message(chat_id, text, parse_mode=parse_mode, disable_web_page_preview=True)
+    if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH: await bot.send_message(chat_id, text, parse_mode=parse_mode, disable_web_page_preview=True)
     else:
-        lines = text.split('\n')
         chunk = ""
-        for line in lines:
+        for line in text.split('\n'):
             if len(chunk) + len(line) + 1 > TELEGRAM_MAX_MESSAGE_LENGTH:
                 await bot.send_message(chat_id, chunk.strip(), parse_mode=parse_mode, disable_web_page_preview=True)
                 chunk = line + "\n"
-            else:
-                chunk += line + "\n"
-        if chunk:
-            await bot.send_message(chat_id, chunk.strip(), parse_mode=parse_mode, disable_web_page_preview=True)
+            else: chunk += line + "\n"
+        if chunk: await bot.send_message(chat_id, chunk.strip(), parse_mode=parse_mode, disable_web_page_preview=True)
 
-# --- Настройки пользователя (Убрана минимальная цена) ---
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
     user_id = update.effective_user.id
     settings_dict = get_user_settings_dict(user_id)
-    
     keyboard = [
         [InlineKeyboardButton(f"Глубина обхода: {settings_dict.get('max_depth', DEFAULT_MAX_DEPTH)}", callback_data="set_max_depth")],
         [InlineKeyboardButton(f"Период (дней): {settings_dict.get('lookback_days', DEFAULT_LOOKBACK_DAYS)}", callback_data="set_lookback_days")],
@@ -503,7 +449,6 @@ async def settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     user_id = query.from_user.id
-    
     if data == "reset_settings":
         from bot.database import get_connection
         with get_connection() as conn:
@@ -511,7 +456,6 @@ async def settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
         await query.edit_message_text("✅ Настройки сброшены на стандартные.")
         return
-        
     setting_map = {
         "set_max_depth": ("max_depth", "Введите новую максимальную глубину обхода связанных кошельков (число, например 3):"),
         "set_lookback_days": ("lookback_days", "Введите период анализа истории в днях (число, например 30):"),
@@ -525,16 +469,12 @@ async def settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def setting_value_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update): return
     key = context.user_data.pop('awaiting_setting', None)
-    if not key:
-        return await handle_message(update, context)
-        
+    if not key: return await handle_message(update, context)
     value = update.message.text.strip()
     if not value.isdigit():
         await update.message.reply_text("❌ Пожалуйста, введите корректное число.")
         return
-        
-    user_id = update.effective_user.id
-    set_user_setting(user_id, key, value)
+    set_user_setting(update.effective_user.id, key, value)
     await update.message.reply_text(f"✅ Настройка успешно обновлена! Новое значение: {value}")
 
 def register_handlers(app):
@@ -544,5 +484,5 @@ def register_handlers(app):
     app.add_handler(CommandHandler("settings", settings))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(history_evm_menu_handler, pattern='history_evm_menu'))
-    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(history_eth|history_bsc|history_solana|history_polygon)$")) # Легко добавлять новые сети
+    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(history_eth|history_bsc|history_polygon)$"))
     app.add_handler(CallbackQueryHandler(settings_button, pattern="^(set_|reset_settings).*"))
