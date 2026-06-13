@@ -1,8 +1,9 @@
 """
 Базовый класс для всех поддерживаемых сетей.
+Создает единый интерфейс (Фабрику), изолируя алгоритм обхода от API провайдеров.
 """
 from abc import ABC, abstractmethod
-from typing import List, Dict, Optional, Tuple, Set
+from typing import List, Dict, Optional, Set
 import aiohttp
 
 class BaseNetwork(ABC):
@@ -26,27 +27,25 @@ class BaseNetwork(ABC):
     def rpc_url(self) -> str:
         return self.config["rpc_url"]
 
-    @property
-    def stablecoins(self) -> List[str]:
-        return self.config.get("stablecoins", [])
-
     @abstractmethod
     async def get_balance(self, address: str) -> float:
-        """Возвращает баланс нативного токена в токенах (например, ETH, BNB)."""
         pass
 
     @abstractmethod
-    async def get_token_balances(self, address: str) -> List[Dict[str, any]]:
-        """Возвращает список словарей с балансами токенов: {address, symbol, balance, decimals}. """
+    async def get_block_by_timestamp(self, timestamp: int) -> int:
+        """Получить номер блока по времени (через Explorer или RPC-приближение)"""
         pass
 
     @abstractmethod
-    async def get_swap_history(self, address: str, start_time: int, end_time: int,
-                               min_amount_native: float, max_tokens: int) -> List[Dict]:
-        """Возвращает список купленных токенов (через любой агрегатор) за период."""
+    async def get_incoming_buys(self, address: str, start_block: int, end_block: int) -> List[Dict]:
+        """Возвращает список токенов (ERC20), поступивших на кошелек: [{'token_address', 'tx_hash', 'block_number'}]"""
+        pass
+
+    @abstractmethod
+    async def get_outgoing_transfers(self, address: str, start_block: int, end_block: int) -> List[Dict]:
+        """Возвращает список получателей средств (Native + ERC20): [{'to', 'value_wei', 'blockNumber'}]"""
         pass
 
     @abstractmethod
     async def validate_address(self, address: str) -> bool:
-        """Проверяет, является ли адрес валидным для этой сети."""
         pass
