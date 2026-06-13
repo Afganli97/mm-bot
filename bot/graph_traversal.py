@@ -10,7 +10,7 @@ import aiohttp
 
 from bot.database import create_request, update_request_status, add_found_token
 from bot.database import get_visited_address_cache, set_visited_address_cache, update_task_progress
-from bot.token_filter import is_excluded, get_token_symbol
+from bot.token_filter import is_excluded
 from bot.blacklist import is_blacklisted
 from bot.api_clients import TokenInfoService, EVMWeb3Client, EVMExplorerClient
 
@@ -33,7 +33,9 @@ class GraphTraversal:
         self.found_tokens = []
         self.unique_token_addresses = set()
         self.token_limit_reached = False
-        self.is_rpc = hasattr(network, 'web3') and isinstance(network.web3, EVMWeb3Client)
+        
+        # Исправлено: теперь мы проверяем наличие эксплорера. У BSC и ETH он теперь есть.
+        self.is_rpc = getattr(self.network, 'explorer', None) is None
 
     async def run(self) -> List[Dict]:
         try:
@@ -44,12 +46,13 @@ class GraphTraversal:
                 now_ts = int(time.time())
                 days_ago_ts = now_ts - self.lookback_days * 86400
                 self.start_block = await self.network.explorer.get_block_by_timestamp(self.session, days_ago_ts)
-                logger.info(f"Период анализа: блоки {self.start_block} - текущий")
+                logger.info(f"Период анализа через Explorer: блоки {self.start_block} - текущий")
             else:
+                # На случай сетей без эксплорера, хотя Etherscan V2 покрывает почти всё
                 days_ago_ts = int(time.time()) - self.lookback_days * 86400
                 self.start_block = await self.network.web3.get_block_by_timestamp_approx(self.session, days_ago_ts)
                 self.end_block = await self.network.web3.get_current_block(self.session)
-                logger.info(f"RPC: приблизительный период блоков {self.start_block} - {self.end_block}")
+                logger.info(f"RPC фоллбэк: период блоков {self.start_block} - {self.end_block}")
 
             queue = deque([(self.start_address, 0)])
             self.visited.add(self.start_address)
@@ -63,11 +66,9 @@ class GraphTraversal:
                     if self.is_rpc:
                         txs = await self._get_incoming_tokens_rpc(addr)
                         for tx in txs:
-                            if len(self.unique_token_addresses) >= self.max_tokens:
-                                break
+                            if len(self.unique_token_addresses) >= self.max_tokens: break
                             token = tx['token_address'].lower()
-                            if token in self.unique_token_addresses or is_excluded(token):
-                                continue
+                            if token in self.unique_token_addresses or is_excluded(token): continue
                             symbol = await TokenInfoService.get_symbol(self.session, token, self.network.config["rpc_url"])
                             add_found_token(self.request_id, token, symbol, addr, tx['tx_hash'], tx['block_number'])
                             self.found_tokens.append({'token': token, 'symbol': symbol, 'buyer': addr, 'tx': tx['tx_hash']})
@@ -75,11 +76,9 @@ class GraphTraversal:
                     else:
                         buys = await self._find_buys_eth(addr)
                         for buy in buys:
-                            if len(self.unique_token_addresses) >= self.max_tokens:
-                                break
+                            if len(self.unique_token_addresses) >= self.max_tokens: break
                             token = buy['token_address']
-                            if token in self.unique_token_addresses or is_excluded(token):
-                                continue
+                            if token in self.unique_token_addresses or is_excluded(token): continue
                             symbol = await TokenInfoService.get_symbol(self.session, token, self.network.config["rpc_url"])
                             add_found_token(self.request_id, token, symbol, addr, buy['tx_hash'], buy['block_number'])
                             self.found_tokens.append({'token': token, 'symbol': symbol, 'buyer': addr, 'tx': buy['tx_hash']})
@@ -91,7 +90,6 @@ class GraphTraversal:
                     self.token_limit_reached = True
                     break
 
-                # Обход получателей (связанные кошельки)
                 if not self.is_rpc and depth + 1 <= self.max_depth:
                     try:
                         transfers, _ = await self._get_outgoing_transfers_and_blocks(addr)
@@ -99,12 +97,10 @@ class GraphTraversal:
                         sorted_recs = sorted(recipients.items(), key=lambda x: x[1], reverse=True)[:50]
                         
                         for to_addr, _ in sorted_recs:
-                            if len(self.unique_token_addresses) >= self.max_tokens:
-                                break
+                            if len(self.unique_token_addresses) >= self.max_tokens: break
                             
-                            # ЗАЩИТА: Проверка адреса по черному списку бирж и мостов!
+                            # Проверка по черному списку бирж и смарт-контрактов
                             if is_blacklisted(to_addr, is_solana=False):
-                                logger.debug(f"Адрес {to_addr} проигнорирован (в черном списке CEX/Мосты)")
                                 continue
 
                             if to_addr not in self.visited:
@@ -121,8 +117,7 @@ class GraphTraversal:
 
         except Exception as e:
             logger.exception("Критическая ошибка во время обхода")
-            if self.request_id:
-                update_request_status(self.request_id, 'error', str(e), finished=True)
+            if self.request_id: update_request_status(self.request_id, 'error', str(e), finished=True)
             raise
 
     async def _get_outgoing_transfers_and_blocks(self, address: str) -> (List[Dict], Set[int]):
@@ -143,26 +138,21 @@ class GraphTraversal:
         return transfers, blocks
 
     def _aggregate_recipients(self, transfers: List[Dict]) -> Dict[str, int]:
-        """Агрегирует переводы по адресам. Игнорирует только строго нулевые переводы."""
         agg = {}
         for t in transfers:
             to = t['to']
             agg[to] = agg.get(to, 0) + t['value_wei']
-        # Отсеиваем только нулевые спам-транзакции. Лимиты цены убраны.
         return {addr: val for addr, val in agg.items() if val > 0}
 
     async def _find_buys_eth(self, address: str) -> List[Dict]:
-        if get_visited_address_cache(address, self.start_block):
-            return []
+        if get_visited_address_cache(address, self.start_block): return []
         txs = await self.network.explorer.get_token_transfers(self.session, address, start_block=self.start_block, end_block=self.end_block, filter_by="to")
         buys = []
         for tx in txs:
-            if tx['contractAddress'].lower() == self.network.config["weth"].lower():
-                continue
+            if tx['contractAddress'].lower() == self.network.config["weth"].lower(): continue
             buys.append({'token_address': tx['contractAddress'].lower(), 'tx_hash': tx['hash'], 'block_number': int(tx['blockNumber'])})
         set_visited_address_cache(address, self.start_block)
         return buys
 
     async def _get_incoming_tokens_rpc(self, address: str) -> List[Dict]:
-        return await self.network.web3.get_token_transfers(self.session, address, direction="to",
-                                                           from_block=self.start_block, to_block=self.end_block)
+        return await self.network.web3.get_token_transfers(self.session, address, direction="to", from_block=self.start_block, to_block=self.end_block)
