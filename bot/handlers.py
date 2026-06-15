@@ -1365,6 +1365,6 @@ def register_handlers(app):
     app.add_handler(
         CallbackQueryHandler(
             settings_button,
-            pattern=r"^(set_|reset_settings)$",
+            pattern=r"^(set_.*|reset_settings)$",
         )
     )

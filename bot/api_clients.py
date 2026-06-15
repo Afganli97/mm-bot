@@ -38,7 +38,11 @@ from bot.config import (
     MORALIS_API_KEY,
     MORALIS_DAILY_LIMIT,
 )
-from bot.database import get_api_usage_today, increment_api_usage
+from bot.database import (
+    get_api_usage_today,
+    get_connection,
+    increment_api_usage,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -64,7 +68,7 @@ class APIKeyRotator:
     def _reset_old_if_needed(self, idx: int) -> None:
         today = time.strftime("%Y-%m-%d")
 
-        with __import__("bot.database").database.get_connection() as conn:
+        with get_connection() as conn:
             conn.execute(
                 """
                 DELETE FROM api_usage
