@@ -1,13 +1,13 @@
 """
-Проверка качества токенов без использования названия.
+Проверка качества токенов.
 
-Источники:
-1. GoPlus Security API — бесплатно для EVM.
-2. Birdeye Security API — для Solana, если задан BIRDEYE_API_KEY.
-3. Exact-one heuristic — если баланс токена ровно 1.
-
-DexScreener НЕ используется как обязательный фильтр,
-потому что он может не показывать неактивные пары.
+Принцип:
+- спам-проверка делается в конце;
+- проверяются только уникальные найденные токены;
+- один и тот же токен не проверяется дважды;
+- если сервис завис/ошибся, токен не блокируется автоматически;
+- fallback: баланс ровно 1 токен считается подозрительным;
+- названия токенов НЕ используются для бана.
 """
 
 import logging
@@ -15,7 +15,6 @@ from typing import Any, Dict, Optional
 
 import aiohttp
 
-from bot.api_clients import DexScreenerPrice
 from bot.config import (
     BIRDEYE_API_KEY,
     ENABLE_BIRDEYE_SECURITY,
@@ -27,6 +26,7 @@ from bot.config import (
     MAX_HISTORY_SELL_TAX_PERCENT,
     MIN_HISTORY_HOLDER_COUNT,
     SOLANA_BALANCE_SECURITY_CHECK,
+    SOLANA_HISTORY_SECURITY_CHECK,
 )
 from bot.database import increment_api_usage
 from bot.token_filter import is_excluded
@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 GOPLUS_BASE_URL = "https://api.gopluslabs.io/api/v1"
+BIRDEYE_SECURITY_URL = "https://public-api.birdeye.so/defi/token_security"
 
 GOPLUS_CHAIN_IDS = {
     "ethereum": "1",
@@ -45,15 +46,11 @@ GOPLUS_CHAIN_IDS = {
     "binance-smart-chain": "56",
 }
 
-BIRDEYE_SECURITY_URL = "https://public-api.birdeye.so/defi/token_security"
-
 
 class TokenReputationService:
     def __init__(self):
-        self.dexscreener = DexScreenerPrice()
         self._goplus_cache: Dict[tuple, Optional[Dict[str, Any]]] = {}
         self._birdeye_cache: Dict[tuple, Optional[Dict[str, Any]]] = {}
-        self._dex_cache: Dict[tuple, Optional[Dict[str, Any]]] = {}
 
     # -----------------------------------------------------------------
     # Helpers
@@ -92,20 +89,6 @@ class TokenReputationService:
             return int(float(value))
         except Exception:
             return 0
-
-    @staticmethod
-    def _network_for_dexscreener(network: str) -> str:
-        mapping = {
-            "ethereum": "ethereum",
-            "eth": "ethereum",
-            "bsc": "bsc",
-            "bnb": "bsc",
-            "binance-smart-chain": "bsc",
-            "solana": "solana",
-            "sol": "solana",
-        }
-
-        return mapping.get((network or "").lower(), (network or "").lower())
 
     @staticmethod
     def _goplus_chain_id(network: str) -> Optional[str]:
@@ -220,13 +203,16 @@ class TokenReputationService:
         address: str,
         network: str = "solana",
     ) -> Optional[Dict[str, Any]]:
+        if (network or "").lower() != "solana":
+            return None
+
         if not ENABLE_BIRDEYE_SECURITY:
             return None
 
-        if not BIRDEYE_API_KEY:
+        if not SOLANA_HISTORY_SECURITY_CHECK and not SOLANA_BALANCE_SECURITY_CHECK:
             return None
 
-        if (network or "").lower() != "solana":
+        if not BIRDEYE_API_KEY:
             return None
 
         if not address:
@@ -302,76 +288,6 @@ class TokenReputationService:
             return None
 
     # -----------------------------------------------------------------
-    # DexScreener только для цены/метаданных
-    # -----------------------------------------------------------------
-
-    async def get_dex_info(
-        self,
-        session: aiohttp.ClientSession,
-        address: str,
-        network: str,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        DexScreener НЕ используется для бана.
-        Используется только чтобы получить цену/liquidity как дополнительную информацию.
-        """
-
-        if not address:
-            return None
-
-        address = address.lower()
-        network = self._network_for_dexscreener(network)
-        cache_key = (address, network)
-
-        if cache_key in self._dex_cache:
-            return self._dex_cache[cache_key]
-
-        try:
-            pairs = await self.dexscreener.get_pairs(session, address)
-
-            if network:
-                filtered_pairs = [
-                    pair
-                    for pair in pairs
-                    if str(pair.get("chainId", "")).lower() == network
-                ]
-
-                if filtered_pairs:
-                    pairs = filtered_pairs
-
-            if not pairs:
-                self._dex_cache[cache_key] = None
-                return None
-
-            best_pair = max(
-                pairs,
-                key=lambda pair: float(
-                    pair.get("liquidity", {}).get("usd", 0) or 0
-                ),
-            )
-
-            liquidity = best_pair.get("liquidity", {}) or {}
-
-            info = {
-                "pair_count": len(pairs),
-                "liquidity_usd": float(liquidity.get("usd", 0) or 0),
-                "fdv": self._to_float(best_pair.get("fdv")),
-                "market_cap": self._to_float(best_pair.get("marketCap")),
-                "price_usd": self._to_float(best_pair.get("priceUsd")),
-                "dex_url": best_pair.get("url", ""),
-                "base_token": best_pair.get("baseToken", {}),
-                "best_pair": best_pair,
-            }
-
-            self._dex_cache[cache_key] = info
-            return info
-
-        except Exception as exc:
-            logger.debug("DexScreener metadata error for %s: %s", address, exc)
-            self._dex_cache[cache_key] = None
-            return None
-
-    # -----------------------------------------------------------------
     # Public API
     # -----------------------------------------------------------------
 
@@ -415,7 +331,7 @@ class TokenReputationService:
 
         return False
 
-    async def should_hide_balance(
+    async def check_token(
         self,
         session: aiohttp.ClientSession,
         address: str,
@@ -424,100 +340,76 @@ class TokenReputationService:
         raw_balance: Optional[int] = None,
         decimals: Optional[int] = None,
         is_native: bool = False,
-    ) -> bool:
+    ) -> Dict[str, Any]:
         """
-        Мягкая проверка для баланса.
-
-        Не скрываем токен из-за:
-        - названия;
-        - отсутствия DexScreener-пары;
-        - отсутствия цены.
-
-        Скрываем если:
-        - security API говорит honeypot/cannot buy/cannot sell/high tax;
-        - баланс ровно 1 токен, если включён exact-one heuristic.
+        Возвращает:
+        {
+            "is_spam": bool,
+            "checked": bool,
+            "reason": str,
+            "service": str|None,
+        }
         """
 
         if is_excluded(address or ""):
-            return True
+            return {
+                "is_spam": True,
+                "checked": True,
+                "reason": "excluded",
+                "service": "local",
+            }
 
-        if (network or "").lower() in ("solana", "sol") and not SOLANA_BALANCE_SECURITY_CHECK:
-            security_info = None
-        else:
+        if not is_native and self.is_exact_one(raw_balance, decimals):
+            return {
+                "is_spam": True,
+                "checked": True,
+                "reason": "exact_one_balance",
+                "service": "fallback",
+            }
+
+        network = (network or "").lower()
+
+        if network in ("solana", "sol") and not SOLANA_HISTORY_SECURITY_CHECK and not SOLANA_BALANCE_SECURITY_CHECK:
+            return {
+                "is_spam": False,
+                "checked": False,
+                "reason": "solana_security_disabled",
+                "service": None,
+            }
+
+        if network in ("ethereum", "eth", "bsc", "bnb", "binance-smart-chain") and not ENABLE_GOPLUS_SECURITY:
+            return {
+                "is_spam": False,
+                "checked": False,
+                "reason": "goplus_disabled",
+                "service": None,
+            }
+
+        try:
             security_info = await self.get_security_info(session, address, network)
+        except Exception as exc:
+            logger.debug("Security service error for %s/%s: %s", network, address, exc)
+
+            return {
+                "is_spam": False,
+                "checked": False,
+                "reason": "security_service_error",
+                "service": None,
+            }
 
         if self.is_hard_security_risk(security_info):
-            logger.info(
-                "Balance skip: hard security risk address=%s network=%s source=%s",
-                address,
-                network,
-                security_info.get("source") if security_info else None,
-            )
-            return True
+            service = security_info.get("source") if security_info else None
 
-        if not is_native and EXACT_ONE_SPAM_FILTER_FOR_BALANCE:
-            if self.is_exact_one(raw_balance, decimals):
-                logger.info(
-                    "Balance skip: exact-one heuristic address=%s network=%s symbol=%s",
-                    address,
-                    network,
-                    symbol,
-                )
-                return True
+            return {
+                "is_spam": True,
+                "checked": True,
+                "reason": "hard_security_risk",
+                "service": service,
+            }
 
-        return False
-
-    async def should_hide_history_token(
-        self,
-        session: aiohttp.ClientSession,
-        address: str,
-        network: str,
-        symbol: Optional[str] = None,
-    ) -> bool:
-        """
-        Проверка для истории.
-
-        Для истории не требуем DexScreener-ликвидность,
-        потому что неактивные пары могут отсутствовать в DexScreener.
-
-        Скрываем только если security API явно показывает риск.
-        """
-
-        if is_excluded(address or ""):
-            return True
-
-        security_info = await self.get_security_info(session, address, network)
-
-        if self.is_hard_security_risk(security_info):
-            logger.info(
-                "History skip: hard security risk address=%s network=%s source=%s",
-                address,
-                network,
-                security_info.get("source") if security_info else None,
-            )
-            return True
-
-        return False
-
-    async def get_price_for_balance(
-        self,
-        session: aiohttp.ClientSession,
-        address: str,
-        network: str,
-    ) -> Optional[float]:
-        """
-        DexScreener используется только для цены.
-        Если пары нет — возвращаем None, но токен не скрываем.
-        """
-
-        info = await self.get_dex_info(session, address, network)
-
-        if not info:
-            return None
-
-        price = float(info.get("price_usd") or 0)
-
-        if price > 0:
-            return price
-
-        return None
+        return {
+            "is_spam": False,
+            "checked": bool(security_info),
+            "reason": "ok" if security_info else "no_security_data",
+            "service": security_info.get("source") if security_info else None,
+        }
