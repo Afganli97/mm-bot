@@ -1,17 +1,10 @@
 """
 Обход цепочки адресов и поиск покупок в Solana через Helius RPC.
 
-Покупка определяется по увеличению token balance:
-postTokenBalances > preTokenBalances.
-
-Исправления:
-- lookback_days реально фильтрует транзакции по blockTime;
-- добавлен timeout, чтобы бот не зависал;
-- добавлен лимит подписей на адрес;
-- запросы Helius считаются в api_usage;
-- задачи пишутся в requests/task_progress;
-- blacklist CEX/DEX применяется к связанным адресам;
-- для истории токены проверяются через TokenReputationService.
+Важно:
+- спам-проверка НЕ делается во время обхода;
+- сначала собираются все найденные токены;
+- потом спам-проверка делается в handlers.py только по уникальным токенам.
 """
 
 import asyncio
@@ -36,7 +29,6 @@ from bot.database import (
     update_task_progress,
 )
 from bot.token_filter import is_excluded
-from bot.token_reputation import TokenReputationService
 
 
 logger = logging.getLogger(__name__)
@@ -82,7 +74,6 @@ class SolanaTraversal:
         self.total_addresses = 0
         self.found_tokens: List[Dict[str, Any]] = []
         self.unique_tokens: Set[str] = set()
-        self.reputation = TokenReputationService()
 
     async def run(self) -> List[Dict[str, Any]]:
         try:
@@ -165,6 +156,7 @@ class SolanaTraversal:
                 )
 
                 older_than_lookback = False
+                last_tx_data = {}
 
                 for sig_info in signatures:
                     if len(self.unique_tokens) >= self.max_tokens:
@@ -186,6 +178,8 @@ class SolanaTraversal:
 
                     if not tx_data:
                         continue
+
+                    last_tx_data = tx_data
 
                     meta = tx_data.get("meta") or {}
 
@@ -228,15 +222,6 @@ class SolanaTraversal:
                         if mint in self.unique_tokens:
                             continue
 
-                        if await self.reputation.should_hide_history_token(
-                            self.session,
-                            mint,
-                            "solana",
-                            symbol=None,
-                        ):
-                            logger.info("Solana hard-risk token skipped: %s", mint)
-                            continue
-
                         self.found_tokens.append(
                             {
                                 "token": mint,
@@ -257,7 +242,7 @@ class SolanaTraversal:
                 if depth + 1 <= self.max_depth:
                     destinations_added = 0
 
-                    for instr in self._iter_instructions(tx_data if "tx_data" in locals() else {}):
+                    for instr in self._iter_instructions(last_tx_data):
                         if len(self.unique_tokens) >= self.max_tokens:
                             break
 
