@@ -1,13 +1,5 @@
 """
 Главный модуль запуска Telegram-бота.
-
-Отвечает за:
-- логирование;
-- инициализацию SQLite;
-- создание глобальной aiohttp-сессии;
-- создание API-клиентов;
-- регистрацию handlers;
-- корректное закрытие ресурсов.
 """
 
 import logging
@@ -90,6 +82,21 @@ async def post_shutdown(app):
         logger.info("HTTP-сессия закрыта")
 
 
+async def error_handler(update, context):
+    error = context.error
+    logger.exception("Unhandled Telegram error: %s", error)
+
+    if update and getattr(update, "effective_chat", None):
+        try:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                "⚠️ Ошибка обработки запроса. Попробуйте позже или отправьте команду /start.",
+                disable_notification=True,
+            )
+        except Exception:
+            logger.debug("Не удалось отправить ошибку пользователю", exc_info=True)
+
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("TELEGRAM_BOT_TOKEN не задан в .env")
@@ -104,6 +111,7 @@ def main():
     )
 
     register_handlers(application)
+    application.add_error_handler(error_handler)
 
     logger.info("Бот запущен")
     application.run_polling()
