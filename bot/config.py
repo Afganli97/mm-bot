@@ -117,35 +117,59 @@ HARD_MAX_BRANCHES_PER_ADDRESS = 100
 
 
 # ---------------------------------------------------------------------
-# Анти-спам / качество токенов
+# Спам-проверка
 # ---------------------------------------------------------------------
-# Важно:
-# - названия токенов НЕ используются для бана;
-# - DexScreener НЕ используется как обязательный фильтр;
-# - для EVM основной источник — GoPlus Security API;
-# - для Solana основной источник — Birdeye Security API, если задан ключ;
-# - exact-one heuristic ловит токены с балансом ровно 1.
 
 ENABLE_GOPLUS_SECURITY = os.getenv("ENABLE_GOPLUS_SECURITY", "1") != "0"
 ENABLE_BIRDEYE_SECURITY = os.getenv("ENABLE_BIRDEYE_SECURITY", "1") != "0"
 
 ENABLE_EXACT_ONE_SPAM_FILTER = os.getenv("ENABLE_EXACT_ONE_SPAM_FILTER", "1") != "0"
 EXACT_ONE_SPAM_FILTER_FOR_BALANCE = os.getenv("EXACT_ONE_SPAM_FILTER_FOR_BALANCE", "1") != "0"
-EXACT_ONE_SPAM_FILTER_FOR_HISTORY = os.getenv("EXACT_ONE_SPAM_FILTER_FOR_HISTORY", "1") != "0"
+EXACT_ONE_SPAM_FILTER_FOR_HISTORY = os.getenv("EXACT_ONE_SPAM_FILTER_FOR_HISTORY", "0") != "0"
 
 MAX_HISTORY_BUY_TAX_PERCENT = float(os.getenv("MAX_HISTORY_BUY_TAX_PERCENT", "30"))
 MAX_HISTORY_SELL_TAX_PERCENT = float(os.getenv("MAX_HISTORY_SELL_TAX_PERCENT", "30"))
-
 MIN_HISTORY_HOLDER_COUNT = int(os.getenv("MIN_HISTORY_HOLDER_COUNT", "0"))
 
-# DexScreener оставляем только для цены/метаданных, не для бана.
-MIN_DEX_LIQUIDITY_USD = float(os.getenv("MIN_DEX_LIQUIDITY_USD", "0"))
-MIN_DEX_FDV_USD = float(os.getenv("MIN_DEX_FDV_USD", "0"))
+SOLANA_BALANCE_SECURITY_CHECK = os.getenv("SOLANA_BALANCE_SECURITY_CHECK", "0") != "0"
+SOLANA_HISTORY_SECURITY_CHECK = os.getenv("SOLANA_HISTORY_SECURITY_CHECK", "0") != "0"
+
+MAX_BALANCE_SPAM_CHECKS = int(os.getenv("MAX_BALANCE_SPAM_CHECKS", "20"))
+MAX_HISTORY_SPAM_CHECKS = int(os.getenv("MAX_HISTORY_SPAM_CHECKS", "100"))
+
+SPAM_CHECK_TIMEOUT_SECONDS = int(os.getenv("SPAM_CHECK_TIMEOUT_SECONDS", "5"))
+
+BALANCE_SPAM_TOTAL_TIMEOUT_SECONDS = int(
+    os.getenv("BALANCE_SPAM_TOTAL_TIMEOUT_SECONDS", "60")
+)
+HISTORY_SPAM_TOTAL_TIMEOUT_SECONDS = int(
+    os.getenv("HISTORY_SPAM_TOTAL_TIMEOUT_SECONDS", "180")
+)
 
 
 # ---------------------------------------------------------------------
-# Solana history protection
+# Solana balance/history stability
 # ---------------------------------------------------------------------
+
+SOLANA_BALANCE_TIMEOUT_SECONDS = int(
+    os.getenv("SOLANA_BALANCE_TIMEOUT_SECONDS", "45")
+)
+
+SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS = int(
+    os.getenv("SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS", "5")
+)
+
+MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE = int(
+    os.getenv("MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE", "0")
+)
+
+SOLANA_HISTORY_NAME_LOOKUP_TIMEOUT_SECONDS = int(
+    os.getenv("SOLANA_HISTORY_NAME_LOOKUP_TIMEOUT_SECONDS", "30")
+)
+
+MAX_SOLANA_HISTORY_NAME_LOOKUPS = int(
+    os.getenv("MAX_SOLANA_HISTORY_NAME_LOOKUPS", "20")
+)
 
 DEFAULT_SOLANA_MAX_SIGNATURES_PER_ADDRESS = int(
     os.getenv("DEFAULT_SOLANA_MAX_SIGNATURES_PER_ADDRESS", "30")
@@ -160,24 +184,6 @@ DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS = int(
 HARD_MAX_SOLANA_HISTORY_TIMEOUT_SECONDS = int(
     os.getenv("HARD_MAX_SOLANA_HISTORY_TIMEOUT_SECONDS", "900")
 )
-
-
-SOLANA_BALANCE_TIMEOUT_SECONDS = int(
-    os.getenv("SOLANA_BALANCE_TIMEOUT_SECONDS", "45")
-)
-
-SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS = int(
-    os.getenv("SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS", "60")
-)
-
-MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE = int(
-    os.getenv("MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE", "20")
-)
-
-SOLANA_BALANCE_SECURITY_CHECK = os.getenv(
-    "SOLANA_BALANCE_SECURITY_CHECK",
-    "0",
-) != "0"
 
 
 # ---------------------------------------------------------------------
