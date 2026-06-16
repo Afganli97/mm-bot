@@ -1,20 +1,5 @@
 """
 Клиенты внешних API и RPC.
-
-Здесь находятся:
-- Etherscan V2;
-- BscScan V2;
-- Ankr;
-- Moralis;
-- Helius;
-- DexScreener;
-- GeckoTerminal;
-- Jupiter;
-- Birdeye;
-- EVM RPC;
-- TokenInfoService.
-
-Все успешные API-запросы пишутся в api_usage.
 """
 
 import asyncio
@@ -47,10 +32,6 @@ from bot.database import (
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------
-# API key rotator
-# ---------------------------------------------------------------------
 
 class APIKeyRotator:
     def __init__(
@@ -202,16 +183,7 @@ bscscan_rotator = APIKeyRotator(
 )
 
 
-# ---------------------------------------------------------------------
-# Etherscan / BscScan
-# ---------------------------------------------------------------------
-
 class EVMExplorerClient:
-    """
-    Etherscan V2 API.
-    Используется для Ethereum.
-    """
-
     BASE_URL = "https://api.etherscan.io/v2/api"
 
     def __init__(self, chain_id: int, weth: str, delay: float = 0.4):
@@ -413,19 +385,10 @@ class EVMExplorerClient:
 
 
 class BscScanExplorerClient(EVMExplorerClient):
-    """
-    BscScan V2 API.
-    Используется для BSC, если задан BSCSCAN_API_KEYS.
-    """
-
     def __init__(self, chain_id: int = 56, weth: Optional[str] = None, delay: float = 0.4):
         super().__init__(chain_id=chain_id, weth=weth or "", delay=delay)
         self.rotator = bscscan_rotator
 
-
-# ---------------------------------------------------------------------
-# Ankr / Moralis / Helius
-# ---------------------------------------------------------------------
 
 class AnkrClient:
     def __init__(self, api_url: str):
@@ -492,7 +455,6 @@ class MoralisClient:
         return []
 
 
-
 class HeliusClient:
     BASE_URL = "https://api.helius.xyz/v1"
     RPC_URL = "https://mainnet.helius-rpc.com"
@@ -538,11 +500,6 @@ class HeliusClient:
         session,
         address: str,
     ) -> Dict[str, Dict[str, Any]]:
-        """
-        Helius REST используем только как источник symbol/name/usdValue.
-        Сами балансы берём через RPC.
-        """
-
         if not self.api_key:
             return {}
 
@@ -577,15 +534,6 @@ class HeliusClient:
         session,
         address: str,
     ) -> Dict[str, Any]:
-        """
-        Корректный сбор Solana-балансов.
-
-        - native SOL берём через getBalance;
-        - SPL-токены берём через getTokenAccountsByOwner;
-        - агрегируем rawAmount по mint;
-        - symbol/name/usdValue берём из Helius REST metadata.
-        """
-
         if not address:
             return {"balances": []}
 
@@ -721,7 +669,7 @@ class HeliusClient:
         session,
         address: str,
         limit: int = 100,
-    ) -> list[dict]:
+    ) -> List[dict]:
         return await self._do_request(
             session,
             "getSignaturesForAddress",
@@ -783,14 +731,14 @@ class DexScreenerPrice:
             return None
 
         if network:
-            network_pairs = [
+            filtered_pairs = [
                 pair
                 for pair in pairs
                 if str(pair.get("chainId", "")).lower() == str(network).lower()
             ]
 
-            if network_pairs:
-                pairs = network_pairs
+            if filtered_pairs:
+                pairs = filtered_pairs
 
         best = max(
             pairs,
@@ -918,21 +866,6 @@ class BirdeyePrice:
 
 
 class CascadePriceFetcher:
-    """
-    Универсальный каскад получения цен.
-
-    Для Solana:
-    1. Jupiter
-    2. Birdeye
-    3. DexScreener
-    4. GeckoTerminal
-
-    Для EVM:
-    1. DexScreener
-    2. GeckoTerminal
-    3. EVMWeb3Client router
-    """
-
     def __init__(self, helius: Optional[HeliusClient] = None):
         self.helius = helius
         self.jupiter = JupiterMassPrice()
@@ -1043,21 +976,7 @@ class EVMPriceCascade:
         return None
 
 
-# ---------------------------------------------------------------------
-# EVM RPC
-# ---------------------------------------------------------------------
-
 class EVMWeb3Client:
-    """
-    RPC-клиент для EVM-сетей.
-
-    Используется для:
-    - нативного баланса;
-    - eth_getLogs ERC20 Transfer;
-    - получения текущего блока;
-    - price через router.
-    """
-
     TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
     ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
@@ -1125,12 +1044,6 @@ class EVMWeb3Client:
         token_address: str,
         weth_price_usd: float,
     ) -> Optional[float]:
-        """
-        Получает цену через getAmountsOut(token -> WETH/WBNB).
-
-        Подходит для Uniswap V2 / PancakeSwap V2-совместимых router.
-        """
-
         if not self.router_address or not self.stable_address:
             return None
 
@@ -1178,13 +1091,6 @@ class EVMWeb3Client:
         session: aiohttp.ClientSession,
         target_timestamp: int,
     ) -> int:
-        """
-        Приблизительное вычисление блока по времени.
-
-        Точного eth_getBlockByTimestamp в обычном JSON-RPC нет.
-        Для BSC берём ~3 сек/блок, для Ethereum ~12 сек/блок.
-        """
-
         current_block = await self.get_current_block(session)
         current_time = int(time.time())
 
@@ -1207,14 +1113,6 @@ class EVMWeb3Client:
         from_block: int = 0,
         to_block: Any = "latest",
     ) -> List[Dict[str, Any]]:
-        """
-        Сбор ERC20 Transfer через eth_getLogs.
-
-        direction:
-        - "to"   = токены, пришедшие на address;
-        - "from" = токены, ушедшие из address.
-        """
-
         if direction not in ("to", "from"):
             raise ValueError("direction must be 'to' or 'from'")
 
@@ -1265,90 +1163,65 @@ class EVMWeb3Client:
                 }
             ]
 
-            try:
-                logs = None
-                last_rpc_error = None
+            logs = None
+            last_rpc_error = None
 
-                for _rpc_attempt in range(4):
-                    try:
-                        logs = await self._rpc_call(session, "eth_getLogs", params)
-                        break
-                    except Exception as rpc_exc:
-                        last_rpc_error = rpc_exc
-                        await asyncio.sleep(1.5 * (_rpc_attempt + 1))
+            for _rpc_attempt in range(4):
+                try:
+                    logs = await self._rpc_call(session, "eth_getLogs", params)
+                    break
+                except Exception as rpc_exc:
+                    last_rpc_error = rpc_exc
+                    await asyncio.sleep(1.5 * (_rpc_attempt + 1))
 
-                if logs is None:
-                    logger.warning(
-                        "RPC getLogs chunk failed after retries %s-%s: %s",
-                        start_b,
-                        end_b,
-                        last_rpc_error,
-                    )
-                    await asyncio.sleep(0.2)
+            if logs is None:
+                logger.warning(
+                    "RPC getLogs chunk failed after retries %s-%s: %s",
+                    start_b,
+                    end_b,
+                    last_rpc_error,
+                )
+                await asyncio.sleep(0.2)
+                continue
+
+            for log in logs or []:
+                token_addr = (log.get("address") or "").lower()
+
+                if not token_addr or token_addr == self.ZERO_ADDRESS:
                     continue
 
-                for log in logs or []:
-                    token_addr = (log.get("address") or "").lower()
+                block_num = int(log.get("blockNumber", "0x0"), 16)
+                tx_hash = log.get("transactionHash") or log.get("transaction_hash") or ""
+                value_hex = log.get("data") or "0x0"
+                value_wei = int(value_hex, 16) if value_hex != "0x" else 0
 
-                    if not token_addr or token_addr == self.ZERO_ADDRESS:
-                        continue
+                log_topics = log.get("topics") or []
 
-                    block_num = int(log.get("blockNumber", "0x0"), 16)
-                    tx_hash = log.get("transactionHash") or log.get("transaction_hash") or ""
-                    value_hex = log.get("data") or "0x0"
-                    value_wei = int(value_hex, 16) if value_hex != "0x" else 0
+                from_addr = ""
+                to_addr = ""
 
-                    log_topics = log.get("topics") or []
+                if len(log_topics) >= 2:
+                    from_addr = "0x" + log_topics[1][26:]
 
-                    from_addr = ""
-                    to_addr = ""
+                if len(log_topics) >= 3:
+                    to_addr = "0x" + log_topics[2][26:]
 
-                    if len(log_topics) >= 2:
-                        from_addr = "0x" + log_topics[1][26:]
-
-                    if len(log_topics) >= 3:
-                        to_addr = "0x" + log_topics[2][26:]
-
-                    if direction == "from":
-                        if not to_addr or to_addr == self.ZERO_ADDRESS:
-                            continue
-
-                        results.append(
-                            {
-                                "token_address": token_addr,
-                                "tx_hash": tx_hash,
-                                "block_number": block_num,
-                                "blockNumber": block_num,
-                                "from": from_addr.lower(),
-                                "to": to_addr.lower(),
-                                "value_wei": value_wei,
-                            }
-                        )
-
-                    else:
-                        results.append(
-                            {
-                                "token_address": token_addr,
-                                "tx_hash": tx_hash,
-                                "block_number": block_num,
-                                "blockNumber": block_num,
-                                "from": from_addr.lower(),
-                                "to": to_addr.lower(),
-                                "value_wei": value_wei,
-                            }
-                        )
-
-            except Exception as exc:
-                logger.debug("RPC getLogs chunk failed %s-%s: %s", start_b, end_b, exc)
+                results.append(
+                    {
+                        "token_address": token_addr,
+                        "tx_hash": tx_hash,
+                        "block_number": block_num,
+                        "blockNumber": block_num,
+                        "from": from_addr.lower(),
+                        "to": to_addr.lower(),
+                        "value_wei": value_wei,
+                    }
+                )
 
             await asyncio.sleep(0.05)
 
         return results
 
-
-# ---------------------------------------------------------------------
-# Token metadata
-# ---------------------------------------------------------------------
 
 class TokenInfoService:
     @staticmethod
