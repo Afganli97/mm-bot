@@ -6,7 +6,6 @@ BSC network layer.
 
 Fallback:
 - RPC eth_getLogs только для ERC20/WBNB.
-  Обычные native BNB transfers через публичный RPC без trace/debug получить нельзя.
 """
 
 import logging
@@ -52,6 +51,8 @@ class BscNetwork(BaseNetwork):
         start_block: int,
         end_block: int,
     ) -> List[Dict]:
+        buys: List[Dict] = []
+
         if self.explorer:
             txs = await self.explorer.get_token_transfers(
                 self.session,
@@ -60,21 +61,35 @@ class BscNetwork(BaseNetwork):
                 end_block=end_block,
                 filter_by="to",
             )
-        else:
-            txs = await self.web3.get_token_transfers(
-                self.session,
-                address,
-                direction="to",
-                from_block=start_block,
-                to_block=end_block,
-            )
 
-        buys: List[Dict] = []
+            for tx in txs:
+                token_address = str(tx.get("contractAddress") or "").lower()
 
-        for tx in txs:
-            token_address = str(
-                tx.get("contractAddress") or tx.get("token_address") or ""
-            ).lower()
+                if not token_address:
+                    continue
+
+                if token_address == self.config["weth"].lower():
+                    continue
+
+                buys.append(
+                    {
+                        "token_address": token_address,
+                        "tx_hash": tx.get("hash") or tx.get("transactionHash") or "",
+                        "block_number": int(tx.get("blockNumber") or 0),
+                        "blockNumber": int(tx.get("blockNumber") or 0),
+                    }
+                )
+
+        rpc_txs = await self.web3.get_token_transfers(
+            self.session,
+            address,
+            direction="to",
+            from_block=start_block,
+            to_block=end_block,
+        )
+
+        for tx in rpc_txs:
+            token_address = str(tx.get("token_address") or "").lower()
 
             if not token_address:
                 continue
@@ -85,9 +100,9 @@ class BscNetwork(BaseNetwork):
             buys.append(
                 {
                     "token_address": token_address,
-                    "tx_hash": tx.get("hash") or tx.get("tx_hash") or tx.get("transactionHash") or "",
-                    "block_number": int(tx.get("blockNumber") or tx.get("block_number") or 0),
-                    "blockNumber": int(tx.get("blockNumber") or tx.get("block_number") or 0),
+                    "tx_hash": tx.get("tx_hash") or tx.get("transactionHash") or "",
+                    "block_number": int(tx.get("block_number") or tx.get("blockNumber") or 0),
+                    "blockNumber": int(tx.get("block_number") or tx.get("blockNumber") or 0),
                 }
             )
 
