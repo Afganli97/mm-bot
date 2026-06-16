@@ -1,17 +1,10 @@
-from bot.token_reputation import TokenReputationService
 """
 Telegram handlers.
-
-Здесь находится вся логика:
-- валидация адресов;
-- EVM/Solana балансы;
-- история покупок;
-- dashboard;
-- настройки пользователя.
 """
 
 import asyncio
 import logging
+import time
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,10 +19,8 @@ from telegram.ext import (
 
 from bot.api_clients import (
     AnkrClient,
-    BirdeyePrice,
     BscScanExplorerClient,
     CascadePriceFetcher,
-    DexScreenerPrice,
     EVMExplorerClient,
     EVMPriceCascade,
     EVMWeb3Client,
@@ -41,7 +32,7 @@ from bot.blacklist import is_blacklisted
 from bot.config import (
     ALCHEMY_API_KEY,
     ALLOWED_USER_IDS,
-    BIRDEYE_API_KEY,
+    BALANCE_SPAM_TOTAL_TIMEOUT_SECONDS,
     BSCSCAN_API_KEYS,
     DEFAULT_LOOKBACK_DAYS,
     DEFAULT_MAX_ADDRESSES,
@@ -49,17 +40,23 @@ from bot.config import (
     DEFAULT_MAX_DEPTH,
     DEFAULT_MAX_FOUND_TOKENS,
     DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS,
-    MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE,
-    SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS,
-    SOLANA_BALANCE_TIMEOUT_SECONDS,
     ETHERSCAN_API_KEYS,
     HARD_MAX_ADDRESSES,
     HARD_MAX_BRANCHES_PER_ADDRESS,
     HARD_MAX_DEPTH,
     HARD_MAX_FOUND_TOKENS,
     HARD_MAX_LOOKBACK_DAYS,
+    HISTORY_SPAM_TOTAL_TIMEOUT_SECONDS,
+    MAX_BALANCE_SPAM_CHECKS,
+    MAX_HISTORY_SPAM_CHECKS,
+    MAX_SOLANA_HISTORY_NAME_LOOKUPS,
+    MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE,
     MIN_USD_VALUE,
     NETWORKS,
+    SPAM_CHECK_TIMEOUT_SECONDS,
+    SOLANA_BALANCE_TIMEOUT_SECONDS,
+    SOLANA_HISTORY_NAME_LOOKUP_TIMEOUT_SECONDS,
+    SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS,
     TELEGRAM_MAX_MESSAGE_LENGTH,
 )
 from bot.database import (
@@ -73,6 +70,7 @@ from bot.networks.bsc import BscNetwork
 from bot.networks.ethereum import EthereumNetwork
 from bot.networks.solana import SolanaNetwork
 from bot.solana_traversal import SolanaTraversal
+from bot.token_reputation import TokenReputationService
 
 
 logger = logging.getLogger(__name__)
@@ -154,25 +152,6 @@ def _format_balance(value: float) -> str:
     return "0"
 
 
-def _is_spam_token(raw_balance: int, decimals: int) -> bool:
-    """
-    Базовый фильтр мусора.
-
-    Важно:
-    - не считаем спамом 1 токен;
-    - не считаем спамом микрокапы;
-    - отсекаем только нулевые/битые балансы.
-    """
-
-    if raw_balance <= 0:
-        return True
-
-    if decimals < 0:
-        return True
-
-    return False
-
-
 def _token_link(chain: str, address: str) -> str:
     if not address:
         return ""
@@ -238,7 +217,6 @@ def _get_effective_settings(user_id: int) -> Dict[str, int]:
             raw_settings,
             "max_tokens",
             DEFAULT_MAX_FOUND_TOKENS,
-    DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS,
             1,
             HARD_MAX_FOUND_TOKENS,
         ),
@@ -276,8 +254,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. Бот агрегирует балансы по доступным сетям.\n"
         "3. Нажмите «История покупок», чтобы найти связанные кошельки и ранние покупки.\n"
         "4. В /settings можно изменить глубину, период, лимит токенов и лимит адресов.\n\n"
-        "<b>Важно:</b> бот использует только бесплатные/лимитные API, поэтому настройки ограничены, "
-        "чтобы не упереться в лимиты.",
+        "<b>Важно:</b> бот использует только бесплатные/лимитные API, поэтому настройки ограничены.",
         parse_mode="HTML",
     )
 
@@ -391,6 +368,165 @@ async def _get_decimals(session, contract_address: str, rpc_url: str) -> int:
     return await TokenInfoService.get_decimals(session, contract_address, rpc_url)
 
 
+async def _run_spam_checks(
+    session,
+    reputation: TokenReputationService,
+    items: List[Dict[str, Any]],
+    max_items: int,
+    total_timeout: int,
+) -> Dict[tuple, Dict[str, Any]]:
+    """
+    Проверяет только уникальные токены.
+    Если сервис завис/ошибся, токен не скрывается автоматически.
+    """
+
+    unique_items: Dict[tuple, Dict[str, Any]] = {}
+
+    for item in items:
+        address = str(item.get("address") or "").lower()
+        network = str(item.get("network") or "").lower()
+
+        if not address or not network:
+            continue
+
+        key = (network, address)
+
+        if key in unique_items:
+            continue
+
+        unique_items[key] = item
+
+    limited_items = list(unique_items.values())[:max_items]
+
+    checked: Dict[tuple, Dict[str, Any]] = {}
+    started = time.monotonic()
+
+    for item in limited_items:
+        if time.monotonic() - started > total_timeout:
+            checked[(item["network"], item["address"])] = {
+                "is_spam": False,
+                "checked": False,
+                "reason": "total_timeout",
+                "service": None,
+            }
+            continue
+
+        key = (item["network"], item["address"])
+
+        try:
+            result = await asyncio.wait_for(
+                reputation.check_token(
+                    session,
+                    address=item["address"],
+                    network=item["network"],
+                    symbol=item.get("symbol"),
+                    raw_balance=item.get("raw_balance"),
+                    decimals=item.get("decimals"),
+                    is_native=bool(item.get("is_native")),
+                ),
+                timeout=SPAM_CHECK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Spam check timeout token=%s/%s", item.get("network"), item.get("address"))
+
+            result = {
+                "is_spam": False,
+                "checked": False,
+                "reason": "timeout",
+                "service": None,
+            }
+
+        except Exception as exc:
+            logger.debug("Spam check error token=%s/%s: %s", item.get("network"), item.get("address"), exc)
+
+            result = {
+                "is_spam": False,
+                "checked": False,
+                "reason": "error",
+                "service": None,
+            }
+
+        checked[key] = result
+
+    return checked
+
+
+async def _apply_balance_spam_filter(
+    session,
+    reputation: TokenReputationService,
+    token_entries: List[Dict[str, Any]],
+) -> Tuple[set, List[str]]:
+    checks = await _run_spam_checks(
+        session,
+        reputation,
+        token_entries,
+        MAX_BALANCE_SPAM_CHECKS,
+        BALANCE_SPAM_TOTAL_TIMEOUT_SECONDS,
+    )
+
+    hidden_keys = {
+        key
+        for key, result in checks.items()
+        if result.get("is_spam")
+    }
+
+    unchecked_count = sum(
+        1
+        for result in checks.values()
+        if not result.get("checked")
+    )
+
+    hidden_count = len(hidden_keys)
+
+    notes = []
+
+    if hidden_count:
+        notes.append(f"Скрыто подозрительных токенов: {hidden_count}")
+
+    if unchecked_count:
+        notes.append(f"Не проверено сервисами из-за timeout/ошибки: {unchecked_count}")
+
+    return hidden_keys, notes
+
+
+async def _apply_history_spam_filter(
+    session,
+    reputation: TokenReputationService,
+    token_entries: List[Dict[str, Any]],
+) -> Tuple[set, List[str]]:
+    checks = await _run_spam_checks(
+        session,
+        reputation,
+        token_entries,
+        MAX_HISTORY_SPAM_CHECKS,
+        HISTORY_SPAM_TOTAL_TIMEOUT_SECONDS,
+    )
+
+    hidden_keys = {
+        key
+        for key, result in checks.items()
+        if result.get("is_spam")
+    }
+
+    unchecked_count = sum(
+        1
+        for result in checks.values()
+        if not result.get("checked")
+    )
+
+    hidden_count = len(hidden_keys)
+
+    notes = []
+
+    if hidden_count:
+        notes.append(f"Скрыто подозрительных токенов: {hidden_count}")
+
+    if unchecked_count:
+        notes.append(f"Не проверено сервисами из-за timeout/ошибки: {unchecked_count}")
+
+    return hidden_keys, notes
+
+
 async def show_multichain_evm_balances(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -406,6 +542,7 @@ async def show_multichain_evm_balances(
     moralis: Optional[MoralisClient] = context.application.bot_data.get("moralis")
     ankr: Optional[AnkrClient] = context.application.bot_data.get("ankr")
     cascade: Optional[CascadePriceFetcher] = context.application.bot_data.get("cascade")
+
     reputation = TokenReputationService()
 
     lines = [
@@ -414,6 +551,7 @@ async def show_multichain_evm_balances(
     ]
 
     total_usd_portfolio = 0.0
+    spam_check_items: List[Dict[str, Any]] = []
 
     # Ethereum: native ETH + Moralis + Alchemy
     if "ethereum" in NETWORKS:
@@ -466,14 +604,17 @@ async def show_multichain_evm_balances(
                         continue
 
                     balance = float(token.get("balance_formatted") or 0)
+                    decimals = int(token.get("tokenDecimal") or token.get("decimals") or 18)
+                    raw_balance = int(token.get("balance") or (balance * (10**decimals)))
                     usd_value = float(token.get("usd_value") or 0)
+                    symbol = str(token.get("symbol") or "?").strip()
 
                     all_eth_tokens[contract] = {
-                        "symbol": str(token.get("symbol") or "?").strip(),
+                        "symbol": symbol,
                         "balance": balance,
                         "usd_val": usd_value,
-                        "raw_balance": int(balance * 10**18),
-                        "decimals": 18,
+                        "raw_balance": raw_balance,
+                        "decimals": decimals,
                         "is_native": False,
                         "address": contract,
                     }
@@ -509,17 +650,6 @@ async def show_multichain_evm_balances(
                         eth_conf["rpc_url"],
                     )
 
-                    if await reputation.should_hide_balance(
-                        session,
-                        contract,
-                        "ethereum",
-                        symbol=symbol,
-                        raw_balance=raw_balance,
-                        decimals=decimals,
-                        is_native=False,
-                    ):
-                        continue
-
                     all_eth_tokens[contract] = {
                         "symbol": symbol,
                         "balance": raw_balance / (10**decimals),
@@ -533,7 +663,7 @@ async def show_multichain_evm_balances(
                 logger.warning("Alchemy Ethereum balances error: %s", exc)
 
         for contract, data in list(all_eth_tokens.items()):
-            if _is_spam_token(int(data.get("raw_balance", 0)), int(data.get("decimals", 18))):
+            if data.get("balance", 0) <= 0:
                 all_eth_tokens.pop(contract, None)
                 continue
 
@@ -546,6 +676,17 @@ async def show_multichain_evm_balances(
 
                 if price:
                     data["usd_val"] = float(data["balance"]) * price
+
+            spam_check_items.append(
+                {
+                    "network": "ethereum",
+                    "address": contract,
+                    "symbol": data.get("symbol"),
+                    "raw_balance": data.get("raw_balance"),
+                    "decimals": data.get("decimals"),
+                    "is_native": data.get("is_native", False),
+                }
+            )
 
         filtered_eth = {
             key: value
@@ -633,35 +774,52 @@ async def show_multichain_evm_balances(
                             continue
 
                         usd_val = float(asset.get("balanceUsd") or 0)
-                        symbol = str(asset.get("tokenSymbol") or "?").strip()
+                        sym = str(asset.get("tokenSymbol") or "?").strip()
                         contract = asset.get("contractAddress") or ""
+                        decimals = int(asset.get("tokenDecimals") or asset.get("decimals") or 18)
+                        raw_balance = int(asset.get("balanceRaw") or asset.get("rawBalance") or 0)
 
-                        chain_total += usd_val
+                        if raw_balance <= 0 and balance > 0:
+                            raw_balance = int(balance * (10**decimals))
 
                         if contract and contract.lower() != "0x0000000000000000000000000000000000000000":
-                            chain_lines.append(
-                                _token_line(
-                                    chain,
-                                    symbol,
-                                    contract,
-                                    balance,
-                                    usd_val,
+                            spam_check_items.append(
+                                {
+                                    "network": chain,
+                                    "address": contract,
+                                    "symbol": sym,
+                                    "raw_balance": raw_balance,
+                                    "decimals": decimals,
+                                    "is_native": False,
+                                }
+                            )
+
+                            chain_total += usd_val
+
+                            if contract and contract.lower() != "0x0000000000000000000000000000000000000000":
+                                chain_lines.append(
+                                    _token_line(
+                                        chain,
+                                        sym,
+                                        contract,
+                                        balance,
+                                        usd_val,
+                                    )
                                 )
-                            )
-                        elif symbol == chain_conf.get("native_symbol") and chain_conf.get("weth"):
-                            chain_lines.append(
-                                _token_line(
-                                    chain,
-                                    symbol,
-                                    chain_conf["weth"],
-                                    balance,
-                                    usd_val,
+                            elif sym == chain_conf.get("native_symbol") and chain_conf.get("weth"):
+                                chain_lines.append(
+                                    _token_line(
+                                        chain,
+                                        sym,
+                                        chain_conf["weth"],
+                                        balance,
+                                        usd_val,
+                                    )
                                 )
-                            )
-                        else:
-                            chain_lines.append(
-                                f"• {symbol}: {_format_balance(balance)} ({_format_usd(usd_val)})"
-                            )
+                            else:
+                                chain_lines.append(
+                                    f"• {sym}: {_format_balance(balance)} ({_format_usd(usd_val)})"
+                                )
 
                     total_usd_portfolio += chain_total
 
@@ -681,6 +839,19 @@ async def show_multichain_evm_balances(
         else:
             lines.append("")
             lines.append("⚠️ Ankr API не настроен. Показан только Ethereum, если доступен RPC.")
+
+    hidden_keys, spam_notes = await _apply_balance_spam_filter(
+        session,
+        reputation,
+        spam_check_items,
+    )
+
+    if spam_notes:
+        lines.append("")
+        lines.append("<b>Спам-фильтр:</b>")
+
+        for note in spam_notes:
+            lines.append(f"• {note}")
 
     lines.insert(2, f"💼 <b>Общий известный баланс портфеля: {_format_usd(total_usd_portfolio)}</b>")
 
@@ -710,10 +881,7 @@ async def show_multichain_evm_balances(
     )
 
 
-async def show_solana_balance(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     address = context.user_data.get("address")
 
     if not address:
@@ -724,7 +892,6 @@ async def show_solana_balance(
 
     helius: Optional[HeliusClient] = context.application.bot_data.get("helius")
     cascade: Optional[CascadePriceFetcher] = context.application.bot_data.get("cascade")
-    reputation = TokenReputationService()
 
     if not helius:
         await update.message.reply_text(
@@ -732,127 +899,209 @@ async def show_solana_balance(
         )
         return
 
-    if not cascade:
-        await update.message.reply_text(
-            "⚠️ CascadePriceFetcher не инициализирован."
-        )
-        return
+    native_sol_mint = getattr(
+        HeliusClient,
+        "NATIVE_SOL_MINT",
+        "So11111111111111111111111111111111111111111",
+    )
+
+    async def fetch_helius_rest_balances() -> List[Dict[str, Any]]:
+        if not helius.api_key:
+            return []
+
+        url = f"{HeliusClient.BASE_URL}/wallet/{address}/balances?api-key={helius.api_key}"
+
+        try:
+            async with session.get(url, timeout=20) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("balances", []) or []
+        except Exception as exc:
+            logger.debug("Helius REST balance fallback error: %s", exc)
+
+        return []
+
+    balances: List[Dict[str, Any]] = []
 
     try:
-        try:
-            data = await asyncio.wait_for(
-                helius.get_wallet_balances(session, address),
-                timeout=SOLANA_BALANCE_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Helius get_wallet_balances timeout address=%s timeout=%s",
-                address,
-                SOLANA_BALANCE_TIMEOUT_SECONDS,
-            )
+        data = await asyncio.wait_for(
+            helius.get_wallet_balances(session, address),
+            timeout=SOLANA_BALANCE_TIMEOUT_SECONDS,
+        )
+
+        if isinstance(data, dict):
+            balances = data.get("balances", []) or []
+
+        non_native = [
+            token
+            for token in balances
+            if token.get("mint") and token.get("mint") != native_sol_mint
+        ]
+
+        if not non_native:
+            rest_balances = await fetch_helius_rest_balances()
+
+            if rest_balances:
+                logger.info(
+                    "Helius RPC дал только native SOL, используем REST fallback. address=%s",
+                    address,
+                )
+                balances = rest_balances
+
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Helius RPC balance timeout. Пробуем REST fallback. address=%s timeout=%s",
+            address,
+            SOLANA_BALANCE_TIMEOUT_SECONDS,
+        )
+        balances = await fetch_helius_rest_balances()
+
+        if not balances:
             await update.message.reply_text(
                 f"⚠️ Helius не ответил за {SOLANA_BALANCE_TIMEOUT_SECONDS} сек. "
                 "Попробуйте позже или проверьте HELIUS_API_KEY."
             )
             return
 
-        if not data:
-            await update.message.reply_text("Solana-балансов не найдено.")
-            return
+    except Exception as exc:
+        logger.exception("Ошибка получения Solana-баланса")
+        await update.message.reply_text(f"❌ Ошибка получения Solana-баланса: {exc}")
+        return
 
-        balances = data.get("balances", [])
+    if not balances:
+        await update.message.reply_text("Solana-балансов не найдено.")
+        return
 
-        if not balances:
-            await update.message.reply_text("Solana-балансов не найдено.")
-            return
+    lines = [
+        f"💰 <b>Баланс Solana</b>",
+        f"<code>{address}</code>",
+    ]
 
-        lines = [
-            f"💰 <b>Баланс Solana</b>",
-            f"<code>{address}</code>",
-        ]
+    additional_prices: Dict[str, float] = {}
 
+    if cascade and MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE > 0:
         no_price_mints = [
             token.get("mint")
             for token in balances
             if token.get("mint")
-            and float(token.get("balance") or 0) > 0
+            and float(token.get("balance") or token.get("uiAmount") or 0) > 0
             and token.get("usdValue") is None
         ][:MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE]
 
-        try:
-            additional_prices = await asyncio.wait_for(
-                cascade.get_prices(
-                    session,
-                    no_price_mints,
-                    network="solana",
-                ),
-                timeout=SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS,
-            ) if no_price_mints else {}
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Solana price lookup timeout mints=%s timeout=%s",
-                len(no_price_mints),
-                SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS,
-            )
-            additional_prices = {}
+        if no_price_mints:
+            try:
+                additional_prices = await asyncio.wait_for(
+                    cascade.get_prices(
+                        session,
+                        no_price_mints,
+                        network="solana",
+                    ),
+                    timeout=SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Solana price lookup timeout. Показываем балансы без цен. mints=%s",
+                    len(no_price_mints),
+                )
+                additional_prices = {}
 
-        total_usd = 0.0
+    total_usd = 0.0
+    spam_check_items: List[Dict[str, Any]] = []
 
-        for token in balances:
-            balance = float(token.get("balance") or 0)
+    for token in balances:
+        balance = float(token.get("balance") or token.get("uiAmount") or 0)
 
-            if balance <= 0:
-                continue
+        if balance <= 0:
+            continue
 
-            symbol = str(token.get("symbol") or token.get("name") or "?").strip()
-            mint = token.get("mint")
+        mint = token.get("mint") or token.get("tokenAddress") or ""
+        symbol = str(token.get("symbol") or token.get("name") or "?").strip()
 
-            usd_val = token.get("usdValue")
+        if not symbol:
+            symbol = "?"
 
-            if usd_val is None and mint in additional_prices:
-                usd_val = additional_prices[mint]
+        raw_amount = int(token.get("rawAmount") or token.get("raw_amount") or 0)
+        decimals = int(token.get("decimals") or 0)
 
-            if usd_val is not None:
+        if raw_amount <= 0 and balance > 0 and decimals >= 0:
+            raw_amount = int(balance * (10**decimals))
+
+        usd_val = token.get("usdValue")
+
+        if usd_val is None and mint in additional_prices:
+            usd_val = balance * additional_prices[mint]
+
+        if usd_val is not None:
+            try:
                 usd_val = float(usd_val)
                 total_usd += usd_val
+            except Exception:
+                usd_val = None
 
-            link = _token_link("solana", mint) if mint else ""
+        is_native_sol = mint == native_sol_mint
 
-            if link:
-                lines.append(
-                    f"• <a href='{link}'>{symbol}</a>: {_format_balance(balance)} ({_format_usd(usd_val)})"
-                )
-            else:
-                lines.append(
-                    f"• {symbol}: {_format_balance(balance)} ({_format_usd(usd_val)})"
-                )
+        if not is_native_sol:
+            spam_check_items.append(
+                {
+                    "network": "solana",
+                    "address": mint,
+                    "symbol": symbol,
+                    "raw_balance": raw_amount,
+                    "decimals": decimals,
+                    "is_native": False,
+                }
+            )
 
-        lines.insert(1, f"Общая известная стоимость: {_format_usd(total_usd)}")
+        display = _format_usd(usd_val)
+        link = _token_link("solana", mint) if mint else ""
 
-        await _send_long_message(
-            context.bot,
-            update.effective_chat.id,
-            "\n".join(lines).strip(),
-            parse_mode="HTML",
-        )
+        if link:
+            lines.append(
+                f"• <a href='{link}'>{symbol}</a>: {_format_balance(balance)} ({display})"
+            )
+        else:
+            lines.append(f"• {symbol}: {_format_balance(balance)} ({display})")
 
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "🔎 Поиск истории покупок Solana",
-                    callback_data="history_solana",
-                )
-            ]
+    reputation = TokenReputationService()
+    hidden_keys, spam_notes = await _apply_balance_spam_filter(
+        session,
+        reputation,
+        spam_check_items,
+    )
+
+    if spam_notes:
+        lines.append("")
+        lines.append("<b>Спам-фильтр:</b>")
+
+        for note in spam_notes:
+            lines.append(f"• {note}")
+
+    lines.insert(1, f"Общая известная стоимость: {_format_usd(total_usd)}")
+
+    if len(lines) <= 2:
+        await update.message.reply_text("Положительных Solana-балансов не найдено.")
+        return
+
+    await _send_long_message(
+        context.bot,
+        update.effective_chat.id,
+        "\n".join(lines).strip(),
+        parse_mode="HTML",
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🔎 Поиск истории покупок Solana",
+                callback_data="history_solana",
+            )
         ]
+    ]
 
-        await update.message.reply_text(
-            "Запустить поиск связей Solana?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-
-    except Exception as exc:
-        logger.exception("Ошибка получения Solana-баланса")
-        await update.message.reply_text(f"❌ Ошибка получения Solana-баланса: {exc}")
+    await update.message.reply_text(
+        "Запустить поиск связей Solana?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def history_evm_menu_handler(
@@ -1012,9 +1261,41 @@ async def run_evm_history(
             )
             return
 
+        reputation = TokenReputationService()
+
+        spam_entries = [
+            {
+                "network": chain,
+                "address": item["token"],
+                "symbol": item.get("symbol", "?"),
+                "raw_balance": None,
+                "decimals": None,
+                "is_native": False,
+            }
+            for item in found
+        ]
+
+        hidden_keys, spam_notes = await _apply_history_spam_filter(
+            session,
+            reputation,
+            spam_entries,
+        )
+
+        filtered_found = [
+            item
+            for item in found
+            if (chain, str(item["token"]).lower()) not in hidden_keys
+        ]
+
+        if not filtered_found:
+            await query.edit_message_text(
+                "✅ Анализ завершён. Найдено только подозрительные/неподтверждённые токены."
+            )
+            return
+
         unique = {
             item["token"]: item
-            for item in found
+            for item in filtered_found
         }
 
         token_lines = [
@@ -1028,9 +1309,16 @@ async def run_evm_history(
             f"Найдено токенов: {len(unique)}\n"
             f"Глубина: {max_depth}\n"
             f"Период: {lookback_days} дней\n"
-            f"Адресов проверено/лимит: до {max_addresses}\n\n"
-            + "\n".join(token_lines)
+            f"Адресов проверено/лимит: до {max_addresses}\n"
         )
+
+        if spam_notes:
+            report += "\n<b>Спам-фильтр:</b>\n"
+
+            for note in spam_notes:
+                report += f"• {note}\n"
+
+        report += "\n" + "\n".join(token_lines)
 
         await _send_long_message(
             context.bot,
@@ -1044,44 +1332,54 @@ async def run_evm_history(
         await query.edit_message_text(f"❌ Ошибка во время обхода графа: {exc}")
 
 
-async def get_token_names_cascade(
-    session,
-    mints: List[str],
-) -> Dict[str, str]:
+async def get_token_names_cascade(session, mints: List[str]) -> Dict[str, str]:
     names: Dict[str, str] = {}
+
+    mints = list(dict.fromkeys(mints or []))[:MAX_SOLANA_HISTORY_NAME_LOOKUPS]
 
     if not mints:
         return names
 
-    unique_mints = list(dict.fromkeys(mints))
-    remaining = list(unique_mints)
+    remaining = list(mints)
 
-    if BIRDEYE_API_KEY:
-        birdeye = BirdeyePrice()
+    if remaining:
+        try:
+            async with session.get(
+                f"https://price.jup.ag/v4/price?ids={','.join(remaining[:100])}",
+                timeout=10,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
 
-        for mint in list(remaining):
-            data = await birdeye.get_token_overview(session, mint)
+                    for mint, info in data.get("data", {}).items():
+                        if isinstance(info, dict):
+                            names[mint] = info.get("name") or info.get("symbol") or "?"
 
-            name = data.get("name") or data.get("symbol")
-
-            if name:
-                names[mint] = name
-                remaining.remove(mint)
-
-            await asyncio.sleep(0.2)
-
-    dexscreener = DexScreenerPrice()
+                            if mint in remaining:
+                                remaining.remove(mint)
+        except Exception as exc:
+            logger.debug("Jupiter name lookup error: %s", exc)
 
     for mint in list(remaining):
-        pairs = await dexscreener.get_pairs(session, mint)
+        try:
+            async with session.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                timeout=5,
+            ) as resp:
+                if resp.status == 200:
+                    pairs = (await resp.json()).get("pairs")
 
-        if pairs:
-            base_token = pairs[0].get("baseToken", {})
-            name = base_token.get("name") or base_token.get("symbol")
+                    if pairs:
+                        base_token = pairs[0].get("baseToken", {})
+                        name = base_token.get("name") or base_token.get("symbol")
 
-            if name:
-                names[mint] = name
-                remaining.remove(mint)
+                        if name:
+                            names[mint] = name
+
+                            if mint in remaining:
+                                remaining.remove(mint)
+        except Exception as exc:
+            logger.debug("DexScreener name lookup error for %s: %s", mint, exc)
 
         await asyncio.sleep(0.2)
 
@@ -1154,30 +1452,79 @@ async def run_solana_history(
             )
             return
 
+        reputation = TokenReputationService()
+
+        spam_entries = [
+            {
+                "network": "solana",
+                "address": item["token"],
+                "symbol": item.get("symbol", "?"),
+                "raw_balance": None,
+                "decimals": None,
+                "is_native": False,
+            }
+            for item in found
+        ]
+
+        hidden_keys, spam_notes = await _apply_history_spam_filter(
+            session,
+            reputation,
+            spam_entries,
+        )
+
+        filtered_found = [
+            item
+            for item in found
+            if ("solana", str(item["token"]).lower()) not in hidden_keys
+        ]
+
+        if not filtered_found:
+            await query.edit_message_text(
+                "✅ Анализ завершён. Найдено только подозрительные/неподтверждённые токены."
+            )
+            return
+
         unique_mints = list(
             {
                 item["token"]
-                for item in found
+                for item in filtered_found
             }
         )
 
-        names = await get_token_names_cascade(session, unique_mints)
+        try:
+            names = await asyncio.wait_for(
+                get_token_names_cascade(session, unique_mints),
+                timeout=SOLANA_HISTORY_NAME_LOOKUP_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Solana token name lookup timeout. Выводим адреса без имён. mints=%s",
+                len(unique_mints),
+            )
+            names = {}
 
         token_lines = [
             f"• <a href='https://dexscreener.com/solana/{item['token']}'>"
             f"{names.get(item['token'], '?')}</a> "
             f"(<code>{item['token']}</code>)"
-            for item in found
+            for item in filtered_found
         ]
 
         report = (
             f"✅ <b>История покупок Solana</b>\n"
-            f"Найдено токенов: {len(found)}\n"
+            f"Найдено токенов: {len(filtered_found)}\n"
             f"Глубина: {max_depth}\n"
             f"Период: {lookback_days} дней\n"
-            f"Адресов проверено/лимит: до {max_addresses}\n\n"
-            + "\n".join(token_lines)
+            f"Адресов проверено/лимит: до {max_addresses}\n"
         )
+
+        if spam_notes:
+            report += "\n<b>Спам-фильтр:</b>\n"
+
+            for note in spam_notes:
+                report += f"• {note}\n"
+
+        report += "\n" + "\n".join(token_lines)
 
         await _send_long_message(
             context.bot,
