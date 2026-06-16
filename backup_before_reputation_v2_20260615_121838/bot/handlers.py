@@ -1,4 +1,3 @@
-from bot.token_reputation import TokenReputationService
 """
 Telegram handlers.
 
@@ -48,10 +47,6 @@ from bot.config import (
     DEFAULT_MAX_BRANCHES_PER_ADDRESS,
     DEFAULT_MAX_DEPTH,
     DEFAULT_MAX_FOUND_TOKENS,
-    DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS,
-    MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE,
-    SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS,
-    SOLANA_BALANCE_TIMEOUT_SECONDS,
     ETHERSCAN_API_KEYS,
     HARD_MAX_ADDRESSES,
     HARD_MAX_BRANCHES_PER_ADDRESS,
@@ -238,7 +233,6 @@ def _get_effective_settings(user_id: int) -> Dict[str, int]:
             raw_settings,
             "max_tokens",
             DEFAULT_MAX_FOUND_TOKENS,
-    DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS,
             1,
             HARD_MAX_FOUND_TOKENS,
         ),
@@ -406,7 +400,6 @@ async def show_multichain_evm_balances(
     moralis: Optional[MoralisClient] = context.application.bot_data.get("moralis")
     ankr: Optional[AnkrClient] = context.application.bot_data.get("ankr")
     cascade: Optional[CascadePriceFetcher] = context.application.bot_data.get("cascade")
-    reputation = TokenReputationService()
 
     lines = [
         f"💰 <b>Мультичейн EVM Балансы</b>",
@@ -503,25 +496,13 @@ async def show_multichain_evm_balances(
 
                     decimals = await _get_decimals(session, contract, eth_conf["rpc_url"])
                     decimals = max(0, decimals)
-                    symbol = await TokenInfoService.get_symbol(
-                        session,
-                        contract,
-                        eth_conf["rpc_url"],
-                    )
-
-                    if await reputation.should_hide_balance(
-                        session,
-                        contract,
-                        "ethereum",
-                        symbol=symbol,
-                        raw_balance=raw_balance,
-                        decimals=decimals,
-                        is_native=False,
-                    ):
-                        continue
 
                     all_eth_tokens[contract] = {
-                        "symbol": symbol,
+                        "symbol": await TokenInfoService.get_symbol(
+                            session,
+                            contract,
+                            eth_conf["rpc_url"],
+                        ),
                         "balance": raw_balance / (10**decimals),
                         "usd_val": 0.0,
                         "raw_balance": raw_balance,
@@ -724,7 +705,6 @@ async def show_solana_balance(
 
     helius: Optional[HeliusClient] = context.application.bot_data.get("helius")
     cascade: Optional[CascadePriceFetcher] = context.application.bot_data.get("cascade")
-    reputation = TokenReputationService()
 
     if not helius:
         await update.message.reply_text(
@@ -739,22 +719,7 @@ async def show_solana_balance(
         return
 
     try:
-        try:
-            data = await asyncio.wait_for(
-                helius.get_wallet_balances(session, address),
-                timeout=SOLANA_BALANCE_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Helius get_wallet_balances timeout address=%s timeout=%s",
-                address,
-                SOLANA_BALANCE_TIMEOUT_SECONDS,
-            )
-            await update.message.reply_text(
-                f"⚠️ Helius не ответил за {SOLANA_BALANCE_TIMEOUT_SECONDS} сек. "
-                "Попробуйте позже или проверьте HELIUS_API_KEY."
-            )
-            return
+        data = await helius.get_wallet_balances(session, address)
 
         if not data:
             await update.message.reply_text("Solana-балансов не найдено.")
@@ -777,24 +742,13 @@ async def show_solana_balance(
             if token.get("mint")
             and float(token.get("balance") or 0) > 0
             and token.get("usdValue") is None
-        ][:MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE]
+        ]
 
-        try:
-            additional_prices = await asyncio.wait_for(
-                cascade.get_prices(
-                    session,
-                    no_price_mints,
-                    network="solana",
-                ),
-                timeout=SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS,
-            ) if no_price_mints else {}
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Solana price lookup timeout mints=%s timeout=%s",
-                len(no_price_mints),
-                SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS,
-            )
-            additional_prices = {}
+        additional_prices = await cascade.get_prices(
+            session,
+            no_price_mints,
+            network="solana",
+        ) if no_price_mints else {}
 
         total_usd = 0.0
 
@@ -1135,18 +1089,7 @@ async def run_solana_history(
             chat_id=chat_id,
         )
 
-        try:
-            found = await asyncio.wait_for(
-                traversal.run(),
-                timeout=DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            await query.edit_message_text(
-                f"⏱ Solana history превысила лимит времени "
-                f"({DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS} сек). "
-                f"Уменьшите глубину, период или максимальное количество адресов."
-            )
-            return
+        found = await traversal.run()
 
         if not found:
             await query.edit_message_text(

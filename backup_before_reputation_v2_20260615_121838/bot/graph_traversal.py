@@ -33,7 +33,6 @@ from bot.database import (
     update_task_progress,
 )
 from bot.token_filter import is_excluded
-from bot.token_reputation import TokenReputationService
 
 
 logger = logging.getLogger(__name__)
@@ -71,7 +70,6 @@ class GraphTraversal:
         self.total_addresses = 0
         self.found_tokens: List[Dict] = []
         self.unique_token_addresses: Set[str] = set()
-        self.reputation = TokenReputationService()
 
     async def run(self) -> List[Dict]:
         try:

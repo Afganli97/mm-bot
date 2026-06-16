@@ -31,7 +31,7 @@ if _raw_allowed_ids:
 
 
 # ---------------------------------------------------------------------
-# Helpers
+# API keys
 # ---------------------------------------------------------------------
 
 def _env_list(name: str) -> List[str]:
@@ -50,10 +50,6 @@ def _env_int_list(name: str) -> List[int]:
 
     return result
 
-
-# ---------------------------------------------------------------------
-# API keys
-# ---------------------------------------------------------------------
 
 ETHERSCAN_API_KEYS = _env_list("ETHERSCAN_API_KEYS")
 BSCSCAN_API_KEYS = _env_list("BSCSCAN_API_KEYS")
@@ -77,6 +73,8 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
 # ---------------------------------------------------------------------
 # API limits
 # ---------------------------------------------------------------------
+# 0 означает, что точный бесплатный лимит неизвестен.
+# Dashboard всё равно будет показывать количество запросов.
 
 API_LIMITS: Dict[str, int] = {
     "etherscan": 100_000,
@@ -85,7 +83,6 @@ API_LIMITS: Dict[str, int] = {
     "moralis": 1_500,
     "helius": 100_000,
     "birdeye": 100_000,
-    "goplus": 0,
     "dexscreener": 0,
     "geckoterminal": 0,
     "jupiter": 0,
@@ -114,70 +111,6 @@ HARD_MAX_ADDRESSES = 2_000
 
 DEFAULT_MAX_BRANCHES_PER_ADDRESS = 50
 HARD_MAX_BRANCHES_PER_ADDRESS = 100
-
-
-# ---------------------------------------------------------------------
-# Анти-спам / качество токенов
-# ---------------------------------------------------------------------
-# Важно:
-# - названия токенов НЕ используются для бана;
-# - DexScreener НЕ используется как обязательный фильтр;
-# - для EVM основной источник — GoPlus Security API;
-# - для Solana основной источник — Birdeye Security API, если задан ключ;
-# - exact-one heuristic ловит токены с балансом ровно 1.
-
-ENABLE_GOPLUS_SECURITY = os.getenv("ENABLE_GOPLUS_SECURITY", "1") != "0"
-ENABLE_BIRDEYE_SECURITY = os.getenv("ENABLE_BIRDEYE_SECURITY", "1") != "0"
-
-ENABLE_EXACT_ONE_SPAM_FILTER = os.getenv("ENABLE_EXACT_ONE_SPAM_FILTER", "1") != "0"
-EXACT_ONE_SPAM_FILTER_FOR_BALANCE = os.getenv("EXACT_ONE_SPAM_FILTER_FOR_BALANCE", "1") != "0"
-EXACT_ONE_SPAM_FILTER_FOR_HISTORY = os.getenv("EXACT_ONE_SPAM_FILTER_FOR_HISTORY", "1") != "0"
-
-MAX_HISTORY_BUY_TAX_PERCENT = float(os.getenv("MAX_HISTORY_BUY_TAX_PERCENT", "30"))
-MAX_HISTORY_SELL_TAX_PERCENT = float(os.getenv("MAX_HISTORY_SELL_TAX_PERCENT", "30"))
-
-MIN_HISTORY_HOLDER_COUNT = int(os.getenv("MIN_HISTORY_HOLDER_COUNT", "0"))
-
-# DexScreener оставляем только для цены/метаданных, не для бана.
-MIN_DEX_LIQUIDITY_USD = float(os.getenv("MIN_DEX_LIQUIDITY_USD", "0"))
-MIN_DEX_FDV_USD = float(os.getenv("MIN_DEX_FDV_USD", "0"))
-
-
-# ---------------------------------------------------------------------
-# Solana history protection
-# ---------------------------------------------------------------------
-
-DEFAULT_SOLANA_MAX_SIGNATURES_PER_ADDRESS = int(
-    os.getenv("DEFAULT_SOLANA_MAX_SIGNATURES_PER_ADDRESS", "30")
-)
-HARD_MAX_SOLANA_MAX_SIGNATURES_PER_ADDRESS = int(
-    os.getenv("HARD_MAX_SOLANA_MAX_SIGNATURES_PER_ADDRESS", "100")
-)
-
-DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS = int(
-    os.getenv("DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS", "600")
-)
-HARD_MAX_SOLANA_HISTORY_TIMEOUT_SECONDS = int(
-    os.getenv("HARD_MAX_SOLANA_HISTORY_TIMEOUT_SECONDS", "900")
-)
-
-
-SOLANA_BALANCE_TIMEOUT_SECONDS = int(
-    os.getenv("SOLANA_BALANCE_TIMEOUT_SECONDS", "45")
-)
-
-SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS = int(
-    os.getenv("SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS", "60")
-)
-
-MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE = int(
-    os.getenv("MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE", "20")
-)
-
-SOLANA_BALANCE_SECURITY_CHECK = os.getenv(
-    "SOLANA_BALANCE_SECURITY_CHECK",
-    "0",
-) != "0"
 
 
 # ---------------------------------------------------------------------
@@ -218,12 +151,12 @@ NETWORKS: Dict[str, dict] = {
         "native_symbol": "ETH",
         "weth": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
         "dex_routers": [
-            "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
-            "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+            "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",  # Uniswap V2 Router
+            "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",  # Uniswap V3 Router 2
         ],
         "stablecoins": [
-            "0xdAC17F958D2ee523a2206206994597C13D831ec7",
-            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            "0xdAC17F958D2ee523a2206206994597C13D831ec7",  # USDT
+            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",  # USDC
         ],
         "rpc_url": _evm_rpc_url(1),
     },
@@ -231,14 +164,14 @@ NETWORKS: Dict[str, dict] = {
         "name": "BSC",
         "chain_id": 56,
         "native_symbol": "BNB",
-        "weth": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+        "weth": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",  # WBNB
         "dex_routers": [
-            "0x10ED43C718714eb63d5aA57B78B54704E256024E",
-            "0x13f4EA83D0bd40E75C8222255bc855a974568Dd4",
+            "0x10ED43C718714eb63d5aA57B78B54704E256024E",  # PancakeSwap Router v2
+            "0x13f4EA83D0bd40E75C8222255bc855a974568Dd4",  # PancakeSwap Router v3
         ],
         "stablecoins": [
-            "0x55d398326f99059fF775485246999027B3197955",
-            "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
+            "0x55d398326f99059fF775485246999027B3197955",  # USDT
+            "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",  # USDC
         ],
         "rpc_url": _evm_rpc_url(56),
     },
@@ -248,13 +181,13 @@ NETWORKS: Dict[str, dict] = {
         "native_symbol": "SOL",
         "weth": None,
         "dex_programs": [
-            "JUP6LbhbzKjY1YJGgBX2RqHGrWFnQHk9mvQLyXZ9iH7",
-            "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
-            "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grHm7Fjkh",
+            "JUP6LbhbzKjY1YJGgBX2RqHGrWFnQHk9mvQLyXZ9iH7",  # Jupiter
+            "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  # Orca Whirlpools
+            "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grHm7Fjkh",  # Raydium CLMM
         ],
         "stablecoins": [
-            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
         ],
         "rpc_url": HELIUS_URL or "https://api.mainnet-beta.solana.com",
     },

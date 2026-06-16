@@ -1,15 +1,15 @@
 """
-Фильтрация токенов.
+Базовый фильтр токенов.
 
-Исключаем:
+Здесь находятся только жёсткие технические исключения:
 - нулевой адрес;
-- основные стейблкоины.
+- стейблкоины.
 
-Не исключаем:
-- микрокапы;
-- токены без CEX;
-- 1 токен;
-- низколиквидные токены.
+Важно:
+- названия токенов НЕ используются для бана;
+- токен с названием SCAM может быть реальным;
+- скам с нормальным названием тоже возможен;
+- настоящая проверка качества токена делается в token_reputation.py.
 """
 
 import logging
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 _ZERO_EVM = "0x0000000000000000000000000000000000000000"
 
-_stable_addresses = {
+_STABLE_ADDRESSES = {
     "0xdAC17F958D2ee523a2206206994597C13D831ec7",  # USDT Ethereum
     "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",  # USDC Ethereum
     "0x6B175474E89094C44Da98b954EedeAC495271d0F",  # DAI Ethereum
@@ -31,13 +31,19 @@ _stable_addresses = {
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT Solana
 }
 
-_stable_set = {
+_STABLE_SET = {
     addr.lower()
-    for addr in _stable_addresses
+    for addr in _STABLE_ADDRESSES
 }
 
 
 def is_excluded(token_address: str) -> bool:
+    """
+    Жёсткое исключение:
+    - нулевой адрес;
+    - стейблкоины.
+    """
+
     if not token_address:
         return True
 
@@ -46,7 +52,26 @@ def is_excluded(token_address: str) -> bool:
     if token_address == _ZERO_EVM:
         return True
 
-    return token_address in _stable_set
+    return token_address in _STABLE_SET
+
+
+def is_spam_token(raw_balance: int, decimals: int) -> bool:
+    """
+    Старая функция оставлена для совместимости.
+
+    Важно:
+    - 1 токен больше не считается спамом только здесь;
+    - exact-one проверка вынесена в token_reputation.py;
+    - название токена здесь не проверяется.
+    """
+
+    if raw_balance <= 0:
+        return True
+
+    if decimals < 0:
+        return True
+
+    return False
 
 
 def get_token_symbol(token_address: str) -> str:

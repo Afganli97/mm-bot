@@ -6,15 +6,12 @@ postTokenBalances > preTokenBalances.
 
 Исправления:
 - lookback_days реально фильтрует транзакции по blockTime;
-- добавлен timeout, чтобы бот не зависал;
-- добавлен лимит подписей на адрес;
+- max_addresses берётся из настроек;
 - запросы Helius считаются в api_usage;
 - задачи пишутся в requests/task_progress;
-- blacklist CEX/DEX применяется к связанным адресам;
-- для истории токены проверяются через TokenReputationService.
+- blacklist CEX/DEX применяется к связанным адресам.
 """
 
-import asyncio
 import logging
 import time
 from collections import deque
@@ -22,21 +19,13 @@ from typing import Any, Dict, List, Set
 
 from bot.api_clients import HeliusClient
 from bot.blacklist import is_blacklisted
-from bot.config import (
-    DEFAULT_MAX_ADDRESSES,
-    DEFAULT_MAX_BRANCHES_PER_ADDRESS,
-    DEFAULT_SOLANA_MAX_SIGNATURES_PER_ADDRESS,
-    DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS,
-    HARD_MAX_SOLANA_MAX_SIGNATURES_PER_ADDRESS,
-    HARD_MAX_SOLANA_HISTORY_TIMEOUT_SECONDS,
-)
+from bot.config import DEFAULT_MAX_ADDRESSES, DEFAULT_MAX_BRANCHES_PER_ADDRESS
 from bot.database import (
     create_request,
     update_request_status,
     update_task_progress,
 )
 from bot.token_filter import is_excluded
-from bot.token_reputation import TokenReputationService
 
 
 logger = logging.getLogger(__name__)
@@ -53,8 +42,6 @@ class SolanaTraversal:
         lookback_days: int = 30,
         max_addresses: int = DEFAULT_MAX_ADDRESSES,
         max_branches_per_address: int = DEFAULT_MAX_BRANCHES_PER_ADDRESS,
-        max_signatures_per_address: int = DEFAULT_SOLANA_MAX_SIGNATURES_PER_ADDRESS,
-        max_runtime_seconds: int = DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS,
         user_id: int = 0,
         chat_id: int = 0,
     ):
@@ -66,14 +53,6 @@ class SolanaTraversal:
         self.lookback_days = int(lookback_days)
         self.max_addresses = int(max_addresses)
         self.max_branches_per_address = int(max_branches_per_address)
-        self.max_signatures_per_address = min(
-            int(max_signatures_per_address),
-            HARD_MAX_SOLANA_MAX_SIGNATURES_PER_ADDRESS,
-        )
-        self.max_runtime_seconds = min(
-            int(max_runtime_seconds),
-            HARD_MAX_SOLANA_HISTORY_TIMEOUT_SECONDS,
-        )
         self.user_id = int(user_id)
         self.chat_id = int(chat_id)
 
@@ -82,40 +61,14 @@ class SolanaTraversal:
         self.total_addresses = 0
         self.found_tokens: List[Dict[str, Any]] = []
         self.unique_tokens: Set[str] = set()
-        self.reputation = TokenReputationService()
 
     async def run(self) -> List[Dict[str, Any]]:
         try:
-            return await asyncio.wait_for(
-                self._run_inner(),
-                timeout=self.max_runtime_seconds,
-            )
-        except asyncio.TimeoutError:
-            logger.error(
-                "Solana traversal timeout address=%s max_runtime=%s",
-                self.start_address,
-                self.max_runtime_seconds,
-            )
-
-            if self.request_id:
-                update_request_status(
-                    self.request_id,
-                    "error",
-                    f"Solana traversal timeout after {self.max_runtime_seconds} seconds",
-                    finished=True,
-                )
-
-            raise
-
-    async def _run_inner(self) -> List[Dict[str, Any]]:
-        try:
             logger.info(
-                "Начало Solana-обхода address=%s depth=%s max_addresses=%s max_signatures=%s timeout=%s",
+                "Начало Solana-обхода address=%s depth=%s max_addresses=%s",
                 self.start_address,
                 self.max_depth,
                 self.max_addresses,
-                self.max_signatures_per_address,
-                self.max_runtime_seconds,
             )
 
             self.request_id = create_request(
@@ -151,17 +104,16 @@ class SolanaTraversal:
                 addr, depth = queue.popleft()
 
                 logger.debug(
-                    "Обработка Solana-адреса %s depth=%s total=%s found=%s",
+                    "Обработка Solana-адреса %s depth=%s total=%s",
                     addr,
                     depth,
                     self.total_addresses,
-                    len(self.unique_tokens),
                 )
 
                 signatures = await self.helius.get_signatures_for_address(
                     self.session,
                     addr,
-                    limit=self.max_signatures_per_address,
+                    limit=100,
                 )
 
                 older_than_lookback = False
@@ -214,8 +166,6 @@ class SolanaTraversal:
                         != "So11111111111111111111111111111111111111111"
                     }
 
-                    block_time = tx_data.get("blockTime") or sig_info.get("blockTime")
-
                     for mint, post_amount in post.items():
                         pre_amount = pre.get(mint, 0.0)
 
@@ -228,22 +178,13 @@ class SolanaTraversal:
                         if mint in self.unique_tokens:
                             continue
 
-                        if await self.reputation.should_hide_history_token(
-                            self.session,
-                            mint,
-                            "solana",
-                            symbol=None,
-                        ):
-                            logger.info("Solana hard-risk token skipped: %s", mint)
-                            continue
-
                         self.found_tokens.append(
                             {
                                 "token": mint,
                                 "symbol": "?",
                                 "buyer": addr,
                                 "tx": sig,
-                                "block_time": block_time,
+                                "block_time": tx_data.get("blockTime") or sig_info.get("blockTime"),
                             }
                         )
 
@@ -255,13 +196,8 @@ class SolanaTraversal:
                     logger.debug("Solana: старые транзакции для %s, переходим дальше", addr)
 
                 if depth + 1 <= self.max_depth:
-                    destinations_added = 0
-
                     for instr in self._iter_instructions(tx_data if "tx_data" in locals() else {}):
                         if len(self.unique_tokens) >= self.max_tokens:
-                            break
-
-                        if destinations_added >= self.max_branches_per_address:
                             break
 
                         if not isinstance(instr, dict):
@@ -295,8 +231,6 @@ class SolanaTraversal:
                         )
 
                         self.total_addresses += 1
-                        destinations_added += 1
-
                         update_task_progress(self.request_id, self.total_addresses)
 
                         if self.total_addresses >= self.max_addresses:

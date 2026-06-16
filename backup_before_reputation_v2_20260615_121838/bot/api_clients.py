@@ -492,29 +492,22 @@ class MoralisClient:
         return []
 
 
-
 class HeliusClient:
     BASE_URL = "https://api.helius.xyz/v1"
-    RPC_URL = "https://mainnet.helius-rpc.com"
-    NATIVE_SOL_MINT = "So11111111111111111111111111111111111111111"
-    TOKEN_PROGRAMS = [
-        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-        "TokenzQdBNbLqP5VEhdkAS6EPFjc8R9fJzCPNQ6KTUu",
-    ]
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.rpc_url = HELIUS_URL or f"{self.RPC_URL}/?api-key={api_key}" if api_key else self.RPC_URL
-        self._semaphore = asyncio.Semaphore(8)
+        self.rpc_url = HELIUS_URL or "https://api.mainnet-beta.solana.com"
+        self._semaphore = asyncio.Semaphore(5)
 
     async def _do_request(
         self,
-        session,
+        session: aiohttp.ClientSession,
         method: str,
         params: list,
     ) -> Any:
         async with self._semaphore:
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.35)
 
             payload = {
                 "jsonrpc": "2.0",
@@ -524,7 +517,7 @@ class HeliusClient:
             }
 
             try:
-                async with session.post(self.rpc_url, json=payload, timeout=20) as resp:
+                async with session.post(self.rpc_url, json=payload, timeout=15) as resp:
                     if resp.status == 200:
                         increment_api_usage("helius", 0)
                         return (await resp.json()).get("result")
@@ -533,195 +526,35 @@ class HeliusClient:
 
             return None
 
-    async def _get_wallet_balances_rest_metadata(
+    async def get_wallet_balances(
         self,
-        session,
+        session: aiohttp.ClientSession,
         address: str,
-    ) -> Dict[str, Dict[str, Any]]:
-        """
-        Helius REST используем только как источник symbol/name/usdValue.
-        Сами балансы берём через RPC.
-        """
-
+    ) -> Dict[str, Any]:
         if not self.api_key:
             return {}
 
-        url = f"{self.BASE_URL}/wallet/{address}/balances?api-key={self.api_key}"
+        url = f"{self.BASE_URL}/wallet/{address}/balances"
+
+        if self.api_key:
+            url += f"?api-key={self.api_key}"
 
         try:
-            async with session.get(url, timeout=20) as resp:
+            async with session.get(url, timeout=15) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    metadata: Dict[str, Dict[str, Any]] = {}
-
-                    for token in data.get("balances", []) or []:
-                        mint = token.get("mint")
-
-                        if not mint:
-                            continue
-
-                        metadata[mint] = {
-                            "symbol": token.get("symbol"),
-                            "name": token.get("name"),
-                            "usdValue": token.get("usdValue"),
-                        }
-
-                    return metadata
+                    increment_api_usage("helius", 0)
+                    return await resp.json()
         except Exception as exc:
-            logger.debug("Helius REST metadata error: %s", exc)
+            logger.error("Helius wallet balances error: %s", exc)
 
         return {}
 
-    async def get_wallet_balances(
-        self,
-        session,
-        address: str,
-    ) -> Dict[str, Any]:
-        """
-        Корректный сбор Solana-балансов.
-
-        - native SOL берём через getBalance;
-        - SPL-токены берём через getTokenAccountsByOwner;
-        - агрегируем rawAmount по mint;
-        - symbol/name/usdValue берём из Helius REST metadata.
-        """
-
-        if not address:
-            return {"balances": []}
-
-        balances_by_mint: Dict[str, Dict[str, Any]] = {}
-
-        native_balance = await self._do_request(
-            session,
-            "getBalance",
-            [
-                address,
-                "confirmed",
-            ],
-        )
-
-        if isinstance(native_balance, dict):
-            native_balance = native_balance.get("value")
-
-        try:
-            native_ui = float(native_balance or 0) / 10**9
-        except Exception:
-            native_ui = 0.0
-
-        if native_ui > 0:
-            balances_by_mint[self.NATIVE_SOL_MINT] = {
-                "mint": self.NATIVE_SOL_MINT,
-                "symbol": "SOL",
-                "name": "Solana",
-                "balance": native_ui,
-                "rawAmount": int(native_ui * 10**9),
-                "decimals": 9,
-                "usdValue": None,
-            }
-
-        for program_id in self.TOKEN_PROGRAMS:
-            try:
-                result = await self._do_request(
-                    session,
-                    "getTokenAccountsByOwner",
-                    [
-                        address,
-                        {
-                            "programId": program_id,
-                        },
-                        {
-                            "encoding": "jsonParsed",
-                            "commitment": "confirmed",
-                        },
-                    ],
-                )
-
-                if not result:
-                    continue
-
-                for item in result.get("value", []) or []:
-                    try:
-                        parsed = item.get("account", {}).get("data", {}).get("parsed", {})
-
-                        if parsed.get("type") != "account":
-                            continue
-
-                        info = parsed.get("info", {})
-                        mint = info.get("mint")
-
-                        if not mint:
-                            continue
-
-                        token_amount = info.get("tokenAmount", {}) or {}
-                        raw_amount = int(token_amount.get("rawAmount") or 0)
-                        decimals = int(token_amount.get("decimals") or 0)
-
-                        if raw_amount <= 0:
-                            continue
-
-                        ui_amount = raw_amount / (10**decimals)
-
-                        current = balances_by_mint.get(mint)
-
-                        if current:
-                            current["rawAmount"] = int(current.get("rawAmount") or 0) + raw_amount
-                            current["balance"] = float(current.get("balance") or 0) + ui_amount
-                            current["decimals"] = decimals
-                        else:
-                            balances_by_mint[mint] = {
-                                "mint": mint,
-                                "symbol": "?",
-                                "name": "?",
-                                "balance": ui_amount,
-                                "rawAmount": raw_amount,
-                                "decimals": decimals,
-                                "usdValue": None,
-                            }
-
-                    except Exception as exc:
-                        logger.debug("Helius token account parse error: %s", exc)
-
-            except Exception as exc:
-                logger.error("Helius getTokenAccountsByOwner error program=%s: %s", program_id, exc)
-
-        metadata = await self._get_wallet_balances_rest_metadata(session, address)
-
-        balances = []
-
-        for mint, data in balances_by_mint.items():
-            meta = metadata.get(mint, {})
-
-            if meta.get("symbol"):
-                data["symbol"] = meta["symbol"]
-
-            if meta.get("name"):
-                data["name"] = meta["name"]
-
-            if meta.get("usdValue") is not None:
-                data["usdValue"] = meta["usdValue"]
-
-            balances.append(data)
-
-        balances.sort(
-            key=lambda item: (
-                float(item.get("usdValue") or 0)
-                if item.get("usdValue") is not None
-                else -1
-            ),
-            reverse=True,
-        )
-
-        return {
-            "balances": balances,
-            "nativeBalance": native_ui,
-        }
-
     async def get_signatures_for_address(
         self,
-        session,
+        session: aiohttp.ClientSession,
         address: str,
         limit: int = 100,
-    ) -> list[dict]:
+    ) -> List[Dict[str, Any]]:
         return await self._do_request(
             session,
             "getSignaturesForAddress",
@@ -735,7 +568,7 @@ class HeliusClient:
 
     async def get_transaction(
         self,
-        session,
+        session: aiohttp.ClientSession,
         signature: str,
     ) -> Dict[str, Any]:
         return await self._do_request(
@@ -750,6 +583,10 @@ class HeliusClient:
             ],
         ) or {}
 
+
+# ---------------------------------------------------------------------
+# Price / token metadata
+# ---------------------------------------------------------------------
 
 class DexScreenerPrice:
     async def get_pairs(
@@ -1244,7 +1081,7 @@ class EVMWeb3Client:
             ]
 
         results: List[Dict[str, Any]] = []
-        chunk_size = 1000 if self.chain_id == 56 else 4_999
+        chunk_size = 4_999
 
         logger.info(
             "RPC getLogs start: address=%s direction=%s blocks=%s-%s",
@@ -1266,26 +1103,7 @@ class EVMWeb3Client:
             ]
 
             try:
-                logs = None
-                last_rpc_error = None
-
-                for _rpc_attempt in range(4):
-                    try:
-                        logs = await self._rpc_call(session, "eth_getLogs", params)
-                        break
-                    except Exception as rpc_exc:
-                        last_rpc_error = rpc_exc
-                        await asyncio.sleep(1.5 * (_rpc_attempt + 1))
-
-                if logs is None:
-                    logger.warning(
-                        "RPC getLogs chunk failed after retries %s-%s: %s",
-                        start_b,
-                        end_b,
-                        last_rpc_error,
-                    )
-                    await asyncio.sleep(0.2)
-                    continue
+                logs = await self._rpc_call(session, "eth_getLogs", params)
 
                 for log in logs or []:
                     token_addr = (log.get("address") or "").lower()
