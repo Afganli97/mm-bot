@@ -1,24 +1,18 @@
 """
 Основной алгоритм обхода адресов и поиска покупок для EVM.
 
-Алгоритм получает стандартизированные данные от сетевого слоя:
-- get_incoming_buys();
-- get_outgoing_transfers();
-- get_block_by_timestamp().
-
-Важные исправления:
-- user_id/chat_id передаются в requests;
-- visited_addresses учитывает chain_id;
-- max_addresses берётся из настроек;
-- max_branches_per_address configurable;
-- lookback_days превращается в block range через network layer.
+Важно:
+- спам-проверка НЕ делается во время обхода;
+- сначала собираются все найденные токены;
+- потом спам-проверка делается в handlers.py только по уникальным токенам.
 """
 
+import asyncio
 import logging
+import time
 from collections import deque
 from typing import Dict, List, Set
 
-from bot.api_clients import TokenInfoService
 from bot.blacklist import is_blacklisted
 from bot.config import (
     DEFAULT_MAX_ADDRESSES,
@@ -33,7 +27,6 @@ from bot.database import (
     update_task_progress,
 )
 from bot.token_filter import is_excluded
-from bot.token_reputation import TokenReputationService
 
 
 logger = logging.getLogger(__name__)
@@ -71,7 +64,6 @@ class GraphTraversal:
         self.total_addresses = 0
         self.found_tokens: List[Dict] = []
         self.unique_token_addresses: Set[str] = set()
-        self.reputation = TokenReputationService()
 
     async def run(self) -> List[Dict]:
         try:
@@ -95,7 +87,7 @@ class GraphTraversal:
                 max_addresses=self.max_addresses,
             )
 
-            days_ago_ts = __import__("time").time() - (self.lookback_days * 86400)
+            days_ago_ts = time.time() - (self.lookback_days * 86400)
 
             self.start_block = await self.network.get_block_by_timestamp(days_ago_ts)
 
@@ -165,31 +157,13 @@ class GraphTraversal:
                             if is_excluded(token):
                                 continue
 
-                            symbol = await TokenInfoService.get_symbol(
-                                self.session,
-                                token,
-                                self.network.rpc_url,
-                            )
-
-                            tx_hash = buy.get("tx_hash") or buy.get("transactionHash") or ""
-                            block_number = int(buy.get("block_number") or buy.get("blockNumber") or 0)
-
-                            add_found_token(
-                                self.request_id,
-                                token,
-                                symbol,
-                                addr,
-                                tx_hash,
-                                block_number,
-                            )
-
                             self.found_tokens.append(
                                 {
                                     "token": token,
-                                    "symbol": symbol,
+                                    "symbol": "?",
                                     "buyer": addr,
-                                    "tx_hash": tx_hash,
-                                    "block_number": block_number,
+                                    "tx_hash": buy.get("tx_hash") or buy.get("transactionHash") or "",
+                                    "block_number": int(buy.get("block_number") or buy.get("blockNumber") or 0),
                                 }
                             )
 
