@@ -5,7 +5,7 @@ Free BscScan + public RPC fallback.
 from typing import Dict, List
 
 from bot.api_clients import BscScanClient, EVMWeb3Client
-from bot.networks.base import BaseNetwork
+from bot.networks._base import BaseNetwork
 
 
 class BscNetwork(BaseNetwork):
