@@ -1,8 +1,5 @@
 """
-Глобальные константы и настройки проекта.
-
-Все настройки берутся из .env.
-Этот файл не должен делать сетевые запросы.
+Глобальные настройки проекта.
 """
 
 import os
@@ -20,14 +17,12 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-ALLOWED_USER_IDS: Set[int] = set()
-_raw_allowed_ids = os.getenv("ALLOWED_USER_IDS", "")
-if _raw_allowed_ids:
-    ALLOWED_USER_IDS = {
-        int(item.strip())
-        for item in _raw_allowed_ids.split(",")
-        if item.strip().isdigit()
-    }
+_ALLOWED_user_ids = os.getenv("ALLOWED_USER_IDS", "")
+ALLOWED_USER_IDS: Set[int] = {
+    int(item.strip())
+    for item in _Allowed_user_ids.split(",")
+    if item.strip().isdigit()
+}
 
 
 # ---------------------------------------------------------------------
@@ -37,18 +32,6 @@ if _raw_allowed_ids:
 def _env_list(name: str) -> List[str]:
     raw = os.getenv(name, "")
     return [item.strip() for item in raw.split(",") if item.strip()]
-
-
-def _env_int_list(name: str) -> List[int]:
-    raw = os.getenv(name, "")
-    result: List[int] = []
-
-    for item in raw.split(","):
-        item = item.strip()
-        if item.isdigit():
-            result.append(int(item))
-
-    return result
 
 
 # ---------------------------------------------------------------------
@@ -75,120 +58,12 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
 
 
 # ---------------------------------------------------------------------
-# API limits
+# RPC
 # ---------------------------------------------------------------------
 
-API_LIMITS: Dict[str, int] = {
-    "etherscan": 100_000,
-    "bscscan": 100_000,
-    "ankr": 100_000,
-    "moralis": 1_500,
-    "helius": 100_000,
-    "birdeye": 100_000,
-    "goplus": 0,
-    "dexscreener": 0,
-    "geckoterminal": 0,
-    "jupiter": 0,
-}
+BSC_RPC_URL = os.getenv("BSC_RPC_URL", "https://bsc-dataseed.binance.org/")
+ETH_RPC_URL = os.getenv("ETH_RPC_URL", "https://eth.llamarpc.com")
 
-ETHERSCAN_DAILY_LIMIT = API_LIMITS["etherscan"]
-BSCSCAN_DAILY_LIMIT = API_LIMITS["bscscan"]
-MORALIS_DAILY_LIMIT = API_LIMITS["moralis"]
-
-
-# ---------------------------------------------------------------------
-# Анализ по умолчанию и жёсткие ограничения
-# ---------------------------------------------------------------------
-
-DEFAULT_MAX_DEPTH = 3
-HARD_MAX_DEPTH = 5
-
-DEFAULT_LOOKBACK_DAYS = 30
-HARD_MAX_LOOKBACK_DAYS = 90
-
-DEFAULT_MAX_FOUND_TOKENS = 100
-HARD_MAX_FOUND_TOKENS = 500
-
-DEFAULT_MAX_ADDRESSES = 2_000
-HARD_MAX_ADDRESSES = 2_000
-
-DEFAULT_MAX_BRANCHES_PER_ADDRESS = 50
-HARD_MAX_BRANCHES_PER_ADDRESS = 100
-
-
-# ---------------------------------------------------------------------
-# Спам-проверка
-# ---------------------------------------------------------------------
-
-ENABLE_GOPLUS_SECURITY = os.getenv("ENABLE_GOPLUS_SECURITY", "1") != "0"
-ENABLE_BIRDEYE_SECURITY = os.getenv("ENABLE_BIRDEYE_SECURITY", "1") != "0"
-
-ENABLE_EXACT_ONE_SPAM_FILTER = os.getenv("ENABLE_EXACT_ONE_SPAM_FILTER", "1") != "0"
-EXACT_ONE_SPAM_FILTER_FOR_BALANCE = os.getenv("EXACT_ONE_SPAM_FILTER_FOR_BALANCE", "1") != "0"
-EXACT_ONE_SPAM_FILTER_FOR_HISTORY = os.getenv("EXACT_ONE_SPAM_FILTER_FOR_HISTORY", "0") != "0"
-
-MAX_HISTORY_BUY_TAX_PERCENT = float(os.getenv("MAX_HISTORY_BUY_TAX_PERCENT", "30"))
-MAX_HISTORY_SELL_TAX_PERCENT = float(os.getenv("MAX_HISTORY_SELL_TAX_PERCENT", "30"))
-MIN_HISTORY_HOLDER_COUNT = int(os.getenv("MIN_HISTORY_HOLDER_COUNT", "0"))
-
-SOLANA_BALANCE_SECURITY_CHECK = os.getenv("SOLANA_BALANCE_SECURITY_CHECK", "0") != "0"
-SOLANA_HISTORY_SECURITY_CHECK = os.getenv("SOLANA_HISTORY_SECURITY_CHECK", "0") != "0"
-
-MAX_BALANCE_SPAM_CHECKS = int(os.getenv("MAX_BALANCE_SPAM_CHECKS", "20"))
-MAX_HISTORY_SPAM_CHECKS = int(os.getenv("MAX_HISTORY_SPAM_CHECKS", "100"))
-
-SPAM_CHECK_TIMEOUT_SECONDS = int(os.getenv("SPAM_CHECK_TIMEOUT_SECONDS", "5"))
-
-BALANCE_SPAM_TOTAL_TIMEOUT_SECONDS = int(
-    os.getenv("BALANCE_SPAM_TOTAL_TIMEOUT_SECONDS", "60")
-)
-HISTORY_SPAM_TOTAL_TIMEOUT_SECONDS = int(
-    os.getenv("HISTORY_SPAM_TOTAL_TIMEOUT_SECONDS", "180")
-)
-
-
-# ---------------------------------------------------------------------
-# Solana balance/history stability
-# ---------------------------------------------------------------------
-
-SOLANA_BALANCE_TIMEOUT_SECONDS = int(
-    os.getenv("SOLANA_BALANCE_TIMEOUT_SECONDS", "45")
-)
-
-SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS = int(
-    os.getenv("SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS", "5")
-)
-
-MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE = int(
-    os.getenv("MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE", "0")
-)
-
-SOLANA_HISTORY_NAME_LOOKUP_TIMEOUT_SECONDS = int(
-    os.getenv("SOLANA_HISTORY_NAME_LOOKUP_TIMEOUT_SECONDS", "30")
-)
-
-MAX_SOLANA_HISTORY_NAME_LOOKUPS = int(
-    os.getenv("MAX_SOLANA_HISTORY_NAME_LOOKUPS", "20")
-)
-
-DEFAULT_SOLANA_MAX_SIGNATURES_PER_ADDRESS = int(
-    os.getenv("DEFAULT_SOLANA_MAX_SIGNATURES_PER_ADDRESS", "30")
-)
-HARD_MAX_SOLANA_MAX_SIGNATURES_PER_ADDRESS = int(
-    os.getenv("HARD_MAX_SOLANA_MAX_SIGNATURES_PER_ADDRESS", "100")
-)
-
-DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS = int(
-    os.getenv("DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS", "600")
-)
-HARD_MAX_SOLANA_HISTORY_TIMEOUT_SECONDS = int(
-    os.getenv("HARD_MAX_SOLANA_HISTORY_TIMEOUT_SECONDS", "900")
-)
-
-
-# ---------------------------------------------------------------------
-# RPC URL fallback
-# ---------------------------------------------------------------------
 
 def _evm_rpc_url(chain_id: int) -> str:
     if ALCHEMY_API_KEY:
@@ -208,9 +83,146 @@ def _evm_rpc_url(chain_id: int) -> str:
         return f"https://{domain}/v3/{INFURA_API_KEY}"
 
     if chain_id == 56:
-        return "https://bsc-dataseed.binance.org/"
+        return BSC_RPC_URL
 
-    return "https://eth.llamarpc.com"
+    return ETH_RPC_URL
+
+
+# ---------------------------------------------------------------------
+# API limits
+# ---------------------------------------------------------------------
+
+API_LIMITS: Dict[str, int] = {
+    "etherscan": 100_000,
+    "bscscan": 0,
+    "ankr": 100_000,
+    "moralis": 1_500,
+    "helius": 100_000,
+    "birdeye": 100_000,
+    "goplus": 0,
+    "dexscreener": 0,
+    "geckoterminal": 0,
+    "jupiter": 0,
+}
+
+
+# ---------------------------------------------------------------------
+# Анализ по умолчанию и ограничения
+# ---------------------------------------------------------------------
+
+DEFAULT_MAX_DEPTH = 3
+HARD_MAX_DEPTH = 5
+
+DEFAULT_LOOKBACK_DAYS = 30
+HARD_MAX_LOOKBACK_DAYS = 90
+
+DEFAULT_MAX_FOUND_TOKENS = 100
+HARD_MAX_FOUND_TOKENS = 500
+
+DEFAULT_MAX_ADDRESSES = 2_000
+HARD_MAX_ADDRESSES = 2_000
+
+DEFAULT_MAX_BRANCHES_PER_ADDRESS = 50
+HARD_MAX_BRANCHES_PER_ADDRESS = 100
+
+
+# ---------------------------------------------------------------------
+# EVM history stability
+# ---------------------------------------------------------------------
+
+EVM_HISTORY_TIMEOUT_SECONDS = int(
+    os.getenv("EVM_HISTORY_TIMEOUT_SECONDS", "600")
+)
+
+EVM_NETWORK_CALL_TIMEOUT_SECONDS = int(
+    os.getenv("EVM_NETWORK_CALL_TIMEOUT_SECONDS", "12")
+)
+
+MAX_EVM_HISTORY_SYMBOL_LOOKUPS = int(
+    os.getenv("MAX_EVM_HISTORY_SYMBOL_LOOKUPS", "100")
+)
+
+
+# ---------------------------------------------------------------------
+# Spam / risk check
+# ---------------------------------------------------------------------
+
+ENABLE_GOPLUS_SECURITY = os.getenv("ENABLE_GOPLUS_SECURITY", "1") != "0"
+
+SPAM_CHECK_TIMEOUT_SECONDS = int(
+    os.getenv("SPAM_CHECK_TIMEOUT_SECONDS", "8")
+)
+
+MAX_BALANCE_SPAM_CHECKS = int(
+    os.getenv("MAX_BALANCE_SPAM_CHECKS", "80")
+)
+
+BALANCE_SPAM_TOTAL_TIMEOUT_SECONDS = int(
+    os.getenv("BALANCE_SPAM_TOTAL_TIMEOUT_SECONDS", "90")
+)
+
+MAX_HISTORY_SPAM_CHECKS = int(
+    os.getenv("MAX_HISTORY_SPAM_CHECKS", "100")
+)
+
+HISTORY_SPAM_TOTAL_TIMEOUT_SECONDS = int(
+    os.getenv("HISTORY_SPAM_TOTAL_TIMEOUT_SECONDS", "120")
+)
+
+MAX_HISTORY_BUY_TAX_PERCENT = float(os.getenv("MAX_HISTORY_BUY_TAX_PERCENT", "30"))
+MAX_HISTORY_SELL_TAX_PERCENT = float(os.getenv("MAX_HISTORY_SELL_TAX_PERCENT", "30"))
+MIN_HISTORY_HOLDER_COUNT = int(os.getenv("MIN_HISTORY_HOLDER_COUNT", "0"))
+
+
+# ---------------------------------------------------------------------
+# Solana
+# ---------------------------------------------------------------------
+
+SOLANA_BALANCE_TIMEOUT_SECONDS = int(
+    os.getenv("SOLANA_BALANCE_TIMEOUT_SECONDS", "45")
+)
+
+SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS = int(
+    os.getenv("SOLANA_PRICE_LOOKUP_TIMEOUT_SECONDS", "5")
+)
+
+MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE = int(
+    os.getenv("MAX_SOLANA_PRICE_LOOKUPS_PER_BALANCE", "0")
+)
+
+SOLANA_BALANCE_SECURITY_CHECK = os.getenv(
+    "SOLANA_BALANCE_SECURITY_CHECK",
+    "0",
+) != "0"
+
+SOLANA_HISTORY_SECURITY_CHECK = os.getenv(
+    "SOLANA_HISTORY_SECURITY_CHECK",
+    "0",
+) != "0"
+
+SOLANA_HISTORY_NAME_LOOKUP_TIMEOUT_SECONDS = int(
+    os.getenv("SOLANA_HISTORY_NAME_LOOKUP_TIMEOUT_SECONDS", "30")
+)
+
+MAX_SOLANA_HISTORY_NAME_LOOKUPS = int(
+    os.getenv("MAX_SOLANA_HISTORY_NAME_LOOKUPS", "20")
+)
+
+DEFAULT_SOLANA_MAX_SIGNATURES_PER_ADDRESS = int(
+    os.getenv("DEFAULT_SOLANA_MAX_SIGNATURES_PER_ADDRESS", "30")
+)
+
+HARD_MAX_SOLANA_MAX_SIGNATURES_PER_ADDRESS = int(
+    os.getenv("HARD_MAX_SOLANA_MAX_SIGNATURES_PER_ADDRESS", "100")
+)
+
+DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS = int(
+    os.getenv("DEFAULT_SOLANA_HISTORY_TIMEOUT_SECONDS", "600")
+)
+
+HARD_MAX_SOLANA_HISTORY_TIMEOUT_SECONDS = int(
+    os.getenv("HARD_MAX_SOLANA_HISTORY_TIMEOUT_SECONDS", "900")
+)
 
 
 # ---------------------------------------------------------------------
