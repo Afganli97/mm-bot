@@ -1,100 +1,39 @@
 """
-Базовый интерфейс для всех поддерживаемых сетей.
-
-Алгоритм обхода не должен знать детали API-провайдера.
-Каждая сеть реализует этот интерфейс.
+Base network interface.
 """
-
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
-
-import aiohttp
+from typing import Dict, List
 
 
 class BaseNetwork(ABC):
-    def __init__(
-        self,
-        network_config: Dict,
-        session: aiohttp.ClientSession,
-    ):
-        self.config = network_config
-        self.session = session
+    key: str
 
     @property
-    def name(self) -> str:
-        return self.config["name"]
-
-    @property
-    def chain_id(self) -> Optional[int]:
-        return self.config.get("chain_id")
-
-    @property
-    def native_symbol(self) -> str:
-        return self.config["native_symbol"]
-
-    @property
-    def rpc_url(self) -> str:
-        return self.config["rpc_url"]
-
     @abstractmethod
-    async def get_balance(self, address: str) -> float:
+    def name(self) -> str:
+        pass
+
+    @property
+    @abstractmethod
+    def rpc_url(self) -> str:
         pass
 
     @abstractmethod
     async def get_block_by_timestamp(self, timestamp: int) -> int:
-        """
-        Получить номер блока по timestamp.
-
-        Для explorer-сетей можно точно.
-        Для RPC-сетей можно приблизительно.
-        """
-
         pass
 
     @abstractmethod
-    async def get_incoming_buys(
-        self,
-        address: str,
-        start_block: int,
-        end_block: int,
-    ) -> List[Dict]:
-        """
-        Возвращает список входящих токенов, которые можно считать покупками.
-
-        Формат:
-        [
-            {
-                "token_address": "...",
-                "tx_hash": "...",
-                "block_number": 123
-            }
-        ]
-        """
-
+    async def get_incoming_buys(self, address: str, start_block: int, end_block: int) -> List[Dict]:
         pass
 
     @abstractmethod
-    async def get_outgoing_transfers(
-        self,
-        address: str,
-        start_block: int,
-        end_block: int,
-    ) -> List[Dict]:
-        """
-        Возвращает исходящие переводы для расширения графа связей.
-
-        Формат:
-        [
-            {
-                "to": "...",
-                "value_wei": 123,
-                "blockNumber": 123
-            }
-        ]
-        """
-
+    async def get_outgoing_related_transfers(self, address: str, start_block: int, end_block: int) -> List[Dict]:
         pass
 
     @abstractmethod
-    async def validate_address(self, address: str) -> bool:
+    async def get_transaction(self, tx_hash: str) -> Dict:
+        pass
+
+    @abstractmethod
+    async def get_native_balance(self, address: str) -> float:
         pass
