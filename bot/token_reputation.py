@@ -1,32 +1,26 @@
 """
-Проверка качества токенов.
+Spam/risk check.
 
-Принцип:
-- спам-проверка делается в конце;
-- проверяются только уникальные найденные токены;
-- один и тот же токен не проверяется дважды;
-- если сервис завис/ошибся, токен не блокируется автоматически;
-- fallback: баланс ровно 1 токен считается подозрительным;
-- названия токенов НЕ используются для бана.
+Принципы:
+1. Названия токенов НЕ используются для бана.
+2. DexScreener НЕ используется как обязательный фильтр.
+3. Если сервис завис или ошибся — токен НЕ скрывается автоматически.
+4. Для баланса есть heuristic: ровно 1 токен считается подозрительным.
+5. Для истории проверяются только уже найденные уникальные токены.
 """
 
+import asyncio
 import logging
 from typing import Any, Dict, Optional
 
-import aiohttp
-
 from bot.config import (
-    BIRDEYE_API_KEY,
-    ENABLE_BIRDEYE_SECURITY,
-    ENABLE_EXACT_ONE_SPAM_FILTER,
     ENABLE_GOPLUS_SECURITY,
-    EXACT_ONE_SPAM_FILTER_FOR_BALANCE,
-    EXACT_ONE_SPAM_FILTER_FOR_HISTORY,
     MAX_HISTORY_BUY_TAX_PERCENT,
     MAX_HISTORY_SELL_TAX_PERCENT,
     MIN_HISTORY_HOLDER_COUNT,
     SOLANA_BALANCE_SECURITY_CHECK,
     SOLANA_HISTORY_SECURITY_CHECK,
+    SPAM_CHECK_TIMEOUT_SECONDS,
 )
 from bot.database import increment_api_usage
 from bot.token_filter import is_excluded
@@ -36,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 
 GOPLUS_BASE_URL = "https://api.gopluslabs.io/api/v1"
-BIRDEYE_SECURITY_URL = "https://public-api.birdeye.so/defi/token_security"
 
 GOPLUS_CHAIN_IDS = {
     "ethereum": "1",
@@ -50,11 +43,6 @@ GOPLUS_CHAIN_IDS = {
 class TokenReputationService:
     def __init__(self):
         self._goplus_cache: Dict[tuple, Optional[Dict[str, Any]]] = {}
-        self._birdeye_cache: Dict[tuple, Optional[Dict[str, Any]]] = {}
-
-    # -----------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------
 
     @staticmethod
     def _to_bool(value: Any) -> bool:
@@ -64,9 +52,7 @@ class TokenReputationService:
         if isinstance(value, bool):
             return value
 
-        text = str(value).strip().lower()
-
-        return text in ("1", "true", "yes", "y")
+        return str(value).strip().lower() in ("1", "true", "yes", "y")
 
     @staticmethod
     def _to_float(value: Any) -> float:
@@ -76,10 +62,8 @@ class TokenReputationService:
         if isinstance(value, (int, float)):
             return float(value)
 
-        text = str(value).strip().replace("%", "")
-
         try:
-            return float(text)
+            return float(str(value).strip().replace("%", ""))
         except Exception:
             return 0.0
 
@@ -91,18 +75,11 @@ class TokenReputationService:
             return 0
 
     @staticmethod
-    def _goplus_chain_id(network: str) -> Optional[str]:
-        return GOPLUS_CHAIN_IDS.get((network or "").lower())
-
-    @staticmethod
-    def is_exact_one(raw_balance: Optional[int], decimals: Optional[int]) -> bool:
-        if not ENABLE_EXACT_ONE_SPAM_FILTER:
-            return False
-
-        if raw_balance is None:
-            return False
-
-        if decimals is None:
+    def is_exact_one(
+        raw_balance: Optional[int],
+        decimals: Optional[int],
+    ) -> bool:
+        if raw_balance is None or decimals is None:
             return False
 
         try:
@@ -111,21 +88,18 @@ class TokenReputationService:
         except Exception:
             return False
 
-        if raw_balance <= 0:
-            return False
-
-        if decimals < 0:
+        if raw_balance <= 0 or decimals < 0:
             return False
 
         return raw_balance == 10**decimals
 
-    # -----------------------------------------------------------------
-    # GoPlus Security API для EVM
-    # -----------------------------------------------------------------
+    @staticmethod
+    def _goplus_chain_id(network: str) -> Optional[str]:
+        return GOPLUS_CHAIN_IDS.get((network or "").lower())
 
     async def get_goplus_info(
         self,
-        session: aiohttp.ClientSession,
+        session,
         address: str,
         network: str,
     ) -> Optional[Dict[str, Any]]:
@@ -134,10 +108,7 @@ class TokenReputationService:
 
         chain_id = self._goplus_chain_id(network)
 
-        if not chain_id:
-            return None
-
-        if not address:
+        if not chain_id or not address:
             return None
 
         address = address.lower()
@@ -151,19 +122,15 @@ class TokenReputationService:
         try:
             async with session.get(
                 url,
-                params={
-                    "contract_addresses": address,
-                },
+                params={"contract_addresses": address},
                 timeout=15,
             ) as resp:
                 if resp.status != 200:
-                    logger.debug("GoPlus HTTP %s for %s", resp.status, address)
                     self._goplus_cache[cache_key] = None
                     return None
 
                 data = await resp.json()
-                result = data.get("result", {}) or {}
-                info = result.get(address)
+                info = (data.get("result") or {}).get(address)
 
                 if not info:
                     self._goplus_cache[cache_key] = None
@@ -177,10 +144,6 @@ class TokenReputationService:
                     "buy_tax": self._to_float(info.get("buy_tax")),
                     "sell_tax": self._to_float(info.get("sell_tax")),
                     "holder_count": self._to_int(info.get("holder_count")),
-                    "owner_balance": self._to_float(info.get("owner_balance")),
-                    "is_mintable": self._to_bool(info.get("is_mintable")),
-                    "is_proxy": self._to_bool(info.get("is_proxy")),
-                    "is_open_source": self._to_bool(info.get("is_open_source")),
                     "raw": info,
                 }
 
@@ -193,107 +156,9 @@ class TokenReputationService:
             self._goplus_cache[cache_key] = None
             return None
 
-    # -----------------------------------------------------------------
-    # Birdeye Security API для Solana
-    # -----------------------------------------------------------------
-
-    async def get_birdeye_security_info(
-        self,
-        session: aiohttp.ClientSession,
-        address: str,
-        network: str = "solana",
-    ) -> Optional[Dict[str, Any]]:
-        if (network or "").lower() != "solana":
-            return None
-
-        if not ENABLE_BIRDEYE_SECURITY:
-            return None
-
-        if not SOLANA_HISTORY_SECURITY_CHECK and not SOLANA_BALANCE_SECURITY_CHECK:
-            return None
-
-        if not BIRDEYE_API_KEY:
-            return None
-
-        if not address:
-            return None
-
-        cache_key = (address, network)
-
-        if cache_key in self._birdeye_cache:
-            return self._birdeye_cache[cache_key]
-
-        try:
-            async with session.get(
-                BIRDEYE_SECURITY_URL,
-                params={
-                    "address": address,
-                    "x-chain": "solana",
-                },
-                headers={
-                    "X-API-KEY": BIRDEYE_API_KEY,
-                },
-                timeout=15,
-            ) as resp:
-                if resp.status != 200:
-                    logger.debug("Birdeye security HTTP %s for %s", resp.status, address)
-                    self._birdeye_cache[cache_key] = None
-                    return None
-
-                data = await resp.json()
-                info = data.get("data", {}) or {}
-
-                if not info:
-                    self._birdeye_cache[cache_key] = None
-                    return None
-
-                parsed = {
-                    "source": "birdeye",
-                    "is_honeypot": self._to_bool(
-                        info.get("is_honeypot")
-                        or info.get("isHoneypot")
-                        or info.get("honeypot")
-                    ),
-                    "cannot_buy": self._to_bool(
-                        info.get("cannot_buy")
-                        or info.get("cannotBuy")
-                    ),
-                    "cannot_sell": self._to_bool(
-                        info.get("cannot_sell")
-                        or info.get("cannotSell")
-                    ),
-                    "buy_tax": self._to_float(
-                        info.get("buy_tax")
-                        or info.get("buyTax")
-                    ),
-                    "sell_tax": self._to_float(
-                        info.get("sell_tax")
-                        or info.get("sellTax")
-                    ),
-                    "holder_count": self._to_int(
-                        info.get("holder_count")
-                        or info.get("holderCount")
-                        or info.get("holder")
-                    ),
-                    "raw": info,
-                }
-
-                increment_api_usage("birdeye", 0)
-                self._birdeye_cache[cache_key] = parsed
-                return parsed
-
-        except Exception as exc:
-            logger.debug("Birdeye security error for %s: %s", address, exc)
-            self._birdeye_cache[cache_key] = None
-            return None
-
-    # -----------------------------------------------------------------
-    # Public API
-    # -----------------------------------------------------------------
-
     async def get_security_info(
         self,
-        session: aiohttp.ClientSession,
+        session,
         address: str,
         network: str,
     ) -> Optional[Dict[str, Any]]:
@@ -303,113 +168,111 @@ class TokenReputationService:
             return await self.get_goplus_info(session, address, network)
 
         if network in ("solana", "sol"):
-            return await self.get_birdeye_security_info(session, address, network)
+            if SOLANA_HISTORY_SECURITY_CHECK or SOLANA_BALANCE_SECURITY_CHECK:
+                logger.warning("Solana security requested, но Birdeye сейчас не используется.")
+            return None
 
         return None
 
-    def is_hard_security_risk(self, security_info: Optional[Dict[str, Any]]) -> bool:
-        if not security_info:
+    @staticmethod
+    def is_hard_security_risk(info: Optional[Dict[str, Any]]) -> bool:
+        if not info:
             return False
 
-        if security_info.get("is_honeypot"):
-            return True
-
-        if security_info.get("cannot_buy"):
-            return True
-
-        if security_info.get("cannot_sell"):
-            return True
-
-        buy_tax = float(security_info.get("buy_tax") or 0)
-        sell_tax = float(security_info.get("sell_tax") or 0)
-
-        if buy_tax > MAX_HISTORY_BUY_TAX_PERCENT:
-            return True
-
-        if sell_tax > MAX_HISTORY_SELL_TAX_PERCENT:
-            return True
-
-        return False
+        return bool(
+            info.get("is_honeypot")
+            or info.get("cannot_buy")
+            or info.get("cannot_sell")
+        )
 
     async def check_token(
         self,
-        session: aiohttp.ClientSession,
+        session,
         address: str,
         network: str,
         symbol: Optional[str] = None,
         raw_balance: Optional[int] = None,
         decimals: Optional[int] = None,
         is_native: bool = False,
+        require_liquidity: bool = False,
     ) -> Dict[str, Any]:
-        """
-        Возвращает:
-        {
-            "is_spam": bool,
-            "checked": bool,
-            "reason": str,
-            "service": str|None,
-        }
-        """
+        address = str(address or "").lower()
+        network = (network or "").lower()
 
-        if is_excluded(address or ""):
-            return {
-                "is_spam": True,
-                "checked": True,
-                "reason": "excluded",
-                "service": "local",
-            }
+        if not address:
+            return {"is_spam": True, "checked": True, "reason": "empty_address"}
+
+        if is_excluded(address):
+            return {"is_spam": True, "checked": True, "reason": "excluded"}
 
         if not is_native and self.is_exact_one(raw_balance, decimals):
             return {
                 "is_spam": True,
                 "checked": True,
-                "reason": "exact_one_balance",
-                "service": "fallback",
+                "reason": "exact_one",
+                "service": "heuristic",
             }
 
-        network = (network or "").lower()
+        if network in ("solana", "sol"):
+            if require_liquidity and not SOLANA_HISTORY_SECURITY_CHECK:
+                return {"is_spam": False, "checked": False, "reason": "service_disabled"}
 
-        if network in ("solana", "sol") and not SOLANA_HISTORY_SECURITY_CHECK and not SOLANA_BALANCE_SECURITY_CHECK:
-            return {
-                "is_spam": False,
-                "checked": False,
-                "reason": "solana_security_disabled",
-                "service": None,
-            }
-
-        if network in ("ethereum", "eth", "bsc", "bnb", "binance-smart-chain") and not ENABLE_GOPLUS_SECURITY:
-            return {
-                "is_spam": False,
-                "checked": False,
-                "reason": "goplus_disabled",
-                "service": None,
-            }
+            if not require_liquidity and not SOLANA_BALANCE_SECURITY_CHECK:
+                return {"is_spam": False, "checked": False, "reason": "service_disabled"}
 
         try:
-            security_info = await self.get_security_info(session, address, network)
+            info = await asyncio.wait_for(
+                self.get_security_info(session, address, network),
+                timeout=SPAM_CHECK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Spam check timeout: %s/%s", network, address)
+            return {"is_spam": False, "checked": False, "reason": "timeout"}
         except Exception as exc:
-            logger.debug("Security service error for %s/%s: %s", network, address, exc)
+            logger.debug("Spam check error: %s/%s: %s", network, address, exc)
+            return {"is_spam": False, "checked": False, "reason": "error"}
 
-            return {
-                "is_spam": False,
-                "checked": False,
-                "reason": "security_service_error",
-                "service": None,
-            }
-
-        if self.is_hard_security_risk(security_info):
-            service = security_info.get("source") if security_info else None
-
+        if self.is_hard_security_risk(info):
             return {
                 "is_spam": True,
                 "checked": True,
                 "reason": "hard_security_risk",
-                "service": service,
+                "service": info.get("source") if info else None,
             }
+
+        if require_liquidity and info:
+            holder_count = int(info.get("holder_count") or 0)
+
+            if holder_count > 0 and holder_count < MIN_HISTORY_HOLDER_COUNT:
+                return {
+                    "is_spam": True,
+                    "checked": True,
+                    "reason": "low_holder_count",
+                    "service": info.get("source"),
+                }
+
+            buy_tax = float(info.get("buy_tax") or 0)
+            sell_tax = float(info.get("sell_tax") or 0)
+
+            if buy_tax > MAX_HISTORY_BUY_TAX_PERCENT:
+                return {
+                    "is_spam": True,
+                    "checked": True,
+                    "reason": "high_buy_tax",
+                    "service": info.get("source"),
+                }
+
+            if sell_tax > MAX_HISTORY_SELL_TAX_PERCENT:
+                return {
+                    "is_spam": True,
+                    "checked": True,
+                    "reason": "high_sell_tax",
+                    "service": info.get("source"),
+                }
 
         return {
             "is_spam": False,
-            "checked": bool(security_info),
-            "reason": "ok" if security_info else "no_security_data",
-            "service": security_info.get("source") if security_info else None,
+            "checked": bool(info),
+            "reason": "ok" if info else "no_data",
+            "service": info.get("source") if info else None,
         }
