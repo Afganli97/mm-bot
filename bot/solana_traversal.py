@@ -121,14 +121,7 @@ class SolanaTraversal:
 
             cutoff_ts = int(time.time()) - (self.lookback_days * 86400)
 
-            queue = deque(
-                [
-                    (
-                        self.start_address,
-                        0,
-                    )
-                ]
-            )
+            queue = deque([(self.start_address, 0)])
 
             self.visited.add(self.start_address)
             self.total_addresses = 1
@@ -187,25 +180,19 @@ class SolanaTraversal:
                         continue
 
                     pre = {
-                        item["mint"]: float(
-                            item.get("uiTokenAmount", {}).get("uiAmount", 0) or 0
-                        )
+                        item["mint"]: float(item.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
                         for item in meta.get("preTokenBalances", [])
                         if item.get("owner") == addr
                         and item.get("mint")
-                        and item.get("mint")
-                        != "So11111111111111111111111111111111111111111"
+                        and item.get("mint") != "So11111111111111111111111111111111111111111"
                     }
 
                     post = {
-                        item["mint"]: float(
-                            item.get("uiTokenAmount", {}).get("uiAmount", 0) or 0
-                        )
+                        item["mint"]: float(item.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
                         for item in meta.get("postTokenBalances", [])
                         if item.get("owner") == addr
                         and item.get("mint")
-                        and item.get("mint")
-                        != "So11111111111111111111111111111111111111111"
+                        and item.get("mint") != "So11111111111111111111111111111111111111111"
                     }
 
                     block_time = tx_data.get("blockTime") or sig_info.get("blockTime")
@@ -272,12 +259,7 @@ class SolanaTraversal:
                             continue
 
                         self.visited.add(dest)
-                        queue.append(
-                            (
-                                dest,
-                                depth + 1,
-                            )
-                        )
+                        queue.append((dest, depth + 1))
 
                         self.total_addresses += 1
                         destinations_added += 1
@@ -289,17 +271,9 @@ class SolanaTraversal:
 
                 update_task_progress(self.request_id, self.total_addresses)
 
-            update_request_status(
-                self.request_id,
-                "done",
-                finished=True,
-            )
+            update_request_status(self.request_id, "done", finished=True)
 
-            logger.info(
-                "Solana-обход завершён. Адресов=%s, токенов=%s",
-                self.total_addresses,
-                len(self.found_tokens),
-            )
+            logger.info("Solana-обход завершён. Адресов=%s, токенов=%s", self.total_addresses, len(self.found_tokens))
 
             return self.found_tokens
 
@@ -307,12 +281,7 @@ class SolanaTraversal:
             logger.exception("Критическая ошибка Solana-обхода")
 
             if self.request_id:
-                update_request_status(
-                    self.request_id,
-                    "error",
-                    str(exc),
-                    finished=True,
-                )
+                update_request_status(self.request_id, "error", str(exc), finished=True)
 
             raise
 
