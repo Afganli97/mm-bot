@@ -17,9 +17,9 @@ from bot.blacklist import is_blacklisted
 from bot.config import (
     DEFAULT_MAX_ADDRESSES,
     DEFAULT_MAX_BRANCHES_PER_ADDRESS,
+    EVM_NETWORK_CALL_TIMEOUT_SECONDS,
 )
 from bot.database import (
-    add_found_token,
     create_request,
     get_visited_address_cache,
     set_visited_address_cache,
@@ -97,20 +97,9 @@ class GraphTraversal:
             if self.start_block > self.end_block:
                 self.start_block, self.end_block = self.end_block, self.start_block
 
-            logger.info(
-                "Период обхода: blocks=%s-%s",
-                self.start_block,
-                self.end_block,
-            )
+            logger.info("Период обхода: blocks=%s-%s", self.start_block, self.end_block)
 
-            queue = deque(
-                [
-                    (
-                        self.start_address,
-                        0,
-                    )
-                ]
-            )
+            queue = deque([(self.start_address, 0)])
 
             self.visited.add(self.start_address)
             self.total_addresses = 1
@@ -131,16 +120,22 @@ class GraphTraversal:
                 )
 
                 try:
-                    if not get_visited_address_cache(
-                        addr,
-                        self.start_block,
-                        chain_id=chain_id,
-                    ):
-                        buys = await self.network.get_incoming_buys(
-                            addr,
-                            self.start_block,
-                            self.end_block,
-                        )
+                    if not get_visited_address_cache(addr, self.start_block, chain_id=chain_id):
+                        try:
+                            buys = await asyncio.wait_for(
+                                self.network.get_incoming_buys(
+                                    addr,
+                                    self.start_block,
+                                    self.end_block,
+                                ),
+                                timeout=EVM_NETWORK_CALL_TIMEOUT_SECONDS,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning("EVM get_incoming_buys timeout address=%s", addr)
+                            buys = []
+                        except Exception as exc:
+                            logger.error("EVM get_incoming_buys error address=%s: %s", addr, exc)
+                            buys = []
 
                         for buy in buys:
                             if len(self.unique_token_addresses) >= self.max_tokens:
@@ -169,11 +164,7 @@ class GraphTraversal:
 
                             self.unique_token_addresses.add(token)
 
-                        set_visited_address_cache(
-                            addr,
-                            self.start_block,
-                            chain_id=chain_id,
-                        )
+                        set_visited_address_cache(addr, self.start_block, chain_id=chain_id)
 
                 except Exception as exc:
                     logger.error("Ошибка при поиске покупок для %s: %s", addr, exc)
@@ -183,11 +174,21 @@ class GraphTraversal:
 
                 if depth + 1 <= self.max_depth:
                     try:
-                        transfers = await self.network.get_outgoing_transfers(
-                            addr,
-                            self.start_block,
-                            self.end_block,
-                        )
+                        try:
+                            transfers = await asyncio.wait_for(
+                                self.network.get_outgoing_transfers(
+                                    addr,
+                                    self.start_block,
+                                    self.end_block,
+                                ),
+                                timeout=EVM_NETWORK_CALL_TIMEOUT_SECONDS,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning("EVM get_outgoing_transfers timeout address=%s", addr)
+                            transfers = []
+                        except Exception as exc:
+                            logger.error("EVM get_outgoing_transfers error address=%s: %s", addr, exc)
+                            transfers = []
 
                         recipients = self._aggregate_recipients(transfers)
 
@@ -211,12 +212,7 @@ class GraphTraversal:
                                 continue
 
                             self.visited.add(to_addr)
-                            queue.append(
-                                (
-                                    to_addr,
-                                    depth + 1,
-                                )
-                            )
+                            queue.append((to_addr, depth + 1))
 
                             self.total_addresses += 1
                             update_task_progress(self.request_id, self.total_addresses)
@@ -227,17 +223,9 @@ class GraphTraversal:
                     except Exception as exc:
                         logger.error("Ошибка при анализе получателей для %s: %s", addr, exc)
 
-            update_request_status(
-                self.request_id,
-                "done",
-                finished=True,
-            )
+            update_request_status(self.request_id, "done", finished=True)
 
-            logger.info(
-                "EVM-обход завершён. Адресов=%s, токенов=%s",
-                self.total_addresses,
-                len(self.found_tokens),
-            )
+            logger.info("EVM-обход завершён. Адресов=%s, токенов=%s", self.total_addresses, len(self.found_tokens))
 
             return self.found_tokens
 
@@ -245,12 +233,7 @@ class GraphTraversal:
             logger.exception("Критическая ошибка EVM-обхода")
 
             if self.request_id:
-                update_request_status(
-                    self.request_id,
-                    "error",
-                    str(exc),
-                    finished=True,
-                )
+                update_request_status(self.request_id, "error", str(exc), finished=True)
 
             raise
 
