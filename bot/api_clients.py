@@ -1,563 +1,405 @@
 """
-API clients.
-
-В этой версии:
-- BSCScan API не используется;
-- BSC история идёт через публичный BSC RPC;
-- цены ищутся через DexScreener -> GeckoTerminal;
-- все HTTP-запросы имеют timeout;
-- Solana балансы берутся напрямую через Helius RPC.
+API clients for free services:
+Etherscan, BscScan, Ankr, Moralis, Alchemy, Helius,
+DexScreener, GeckoTerminal, Jupiter, Birdeye, public RPC.
 """
-
 import asyncio
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import aiohttp
-from web3 import Web3
 
+from bot.config import (
+    ETHERSCAN_API_KEYS,
+    BSCSCAN_API_KEYS,
+    ANKR_API_URL,
+    BIRDEYE_API_KEY,
+)
+from bot.rate_limits import RateLimitExceeded, RateLimitTracker
 
 logger = logging.getLogger(__name__)
 
 
-TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+class APIKeyRotator:
+    def __init__(self, service: str, keys: List[str], delay: float = 0.0):
+        self.service = service
+        self.keys = keys or [""]
+        self.delay = delay
 
+    def get_available_key(self):
+        for i, key in enumerate(self.keys):
+            if RateLimitTracker.is_available(self.service, i):
+                return key, i
+        return None
 
-def _hex_to_address(value: str) -> str:
-    try:
-        return "0x" + value.replace("0x", "")[-40:].lower()
-    except Exception:
-        return ""
-
-
-def _hex_to_int(value: Any) -> int:
-    try:
-        return int(str(value), 16)
-    except Exception:
-        return 0
-
-
-class TokenInfoService:
-    @staticmethod
-    async def get_symbol(session, contract_address: str, rpc_url: str) -> str:
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "eth_call",
-            "params": [
-                {
-                    "to": contract_address,
-                    "data": "0x95d89b41",
-                },
-                "latest",
-            ],
-            "id": 1,
-        }
-
-        try:
-            async with session.post(rpc_url, json=payload, timeout=8) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    result = data.get("result")
-
-                    if result and result != "0x":
-                        return Web3.to_text(result).strip("\x00")
-        except Exception:
-            pass
-
-        return "?"
-
-    @staticmethod
-    async def get_name(session, contract_address: str, rpc_url: str) -> str:
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "eth_call",
-            "params": [
-                {
-                    "to": contract_address,
-                    "data": "0x06fdde03",
-                },
-                "latest",
-            ],
-            "id": 1,
-        }
-
-        try:
-            async with session.post(rpc_url, json=payload, timeout=8) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    result = data.get("result")
-
-                    if result and result != "0x":
-                        return Web3.to_text(result).strip("\x00")
-        except Exception:
-            pass
-
-        return "?"
-
-    @staticmethod
-    async def get_decimals(session, contract_address: str, rpc_url: str) -> int:
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "eth_call",
-            "params": [
-                {
-                    "to": contract_address,
-                    "data": "0x313ce567",
-                },
-                "latest",
-            ],
-            "id": 1,
-        }
-
-        try:
-            async with session.post(rpc_url, json=payload, timeout=8) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    result = data.get("result")
-
-                    if result:
-                        return int(result, 16)
-        except Exception:
-            pass
-
-        return 18
-
-
-class EVMWeb3Client:
-    def __init__(
+    async def make_request(
         self,
-        rpc_url: str,
-        chain_id: int,
-        weth: str,
-        router: str = "",
-        stable: str = "",
-        chunk_size: int = 1000,
-    ):
-        self.rpc_url = rpc_url
-        self.chain_id = int(chain_id)
-        self.weth = (weth or "").lower()
-        self.router = router or ""
-        self.stable = stable or ""
-        self.chunk_size = 1000 if chain_id == 56 else 4_999
+        session: aiohttp.ClientSession,
+        method: str,
+        url: str,
+        params: Optional[Dict] = None,
+        json_body: Optional[Dict] = None,
+        headers: Optional[Dict] = None,
+        delay: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        delay = self.delay if delay is None else delay
 
-    async def _rpc_call(self, session, method: str, params: list) -> Any:
-        payload = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-            "id": 1,
-        }
+        for _ in range(len(self.keys) * 2 + 1):
+            key_info = self.get_available_key()
+            if not key_info:
+                raise RateLimitExceeded(f"Лимит {self.service} исчерпан")
 
-        async with session.post(self.rpc_url, json=payload, timeout=20) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"RPC HTTP {resp.status}")
+            key, idx = key_info
 
-            data = await resp.json()
-
-            if "error" in data:
-                raise RuntimeError(data["error"])
-
-            return data.get("result")
-
-    async def get_balance(self, session, address: str) -> float:
-        result = await self._rpc_call(session, "eth_getBalance", [address, "latest"])
-        return _hex_to_int(result) / 10**18
-
-    async def get_current_block(self, session) -> int:
-        result = await self._rpc_call(session, "eth_blockNumber", [])
-        return _hex_to_int(result)
-
-    async def get_block_by_timestamp_approx(self, session, timestamp: int) -> int:
-        latest = await self.get_current_block(session)
-        return max(0, latest - 500_000)
-
-    async def get_token_transfers(
-        self,
-        session,
-        address: str,
-        direction: str,
-        from_block: int,
-        to_block: int,
-    ) -> List[Dict[str, Any]]:
-        address = address.lower()
-        transfers = []
-
-        for start in range(int(from_block), int(to_block) + 1, self.chunk_size):
-            end = min(start + self.chunk_size - 1, int(to_block))
-
-            topics = [TRANSFER_TOPIC]
-
-            if direction == "to":
-                topics.extend([None, address])
-            elif direction == "from":
-                topics.extend([address, None])
-
-            params = [
-                {
-                    "fromBlock": hex(start),
-                    "toBlock": hex(end),
-                    "topics": topics,
-                }
-            ]
-
-            try:
-                logs = await self._rpc_call(session, "eth_getLogs", params)
-            except Exception as exc:
-                logger.warning("eth_getLogs failed %s-%s: %s", start, end, exc)
+            if not RateLimitTracker.reserve(self.service, idx):
                 await asyncio.sleep(1)
                 continue
 
-            for log in logs or []:
-                try:
-                    if len(log.get("topics") or []) < 3:
-                        continue
+            req_params = dict(params or {})
+            req_headers = dict(headers or {})
+            req_json = dict(json_body) if json_body is not None else None
 
-                    tx_hash = str(log.get("transactionHash") or "").lower()
-                    contract_address = str(log.get("address") or "").lower()
+            if self.service == "etherscan":
+                req_params["apikey"] = key
+                req_params["chainid"] = "1"
+            elif self.service == "bscscan":
+                if key:
+                    req_params["apikey"] = key
 
-                    from_addr = _hex_to_address(log["topics"][1])
-                    to_addr = _hex_to_address(log["topics"][2])
+            try:
+                if delay:
+                    await asyncio.sleep(delay)
 
-                    if direction == "to" and to_addr != address:
-                        continue
+                if method.upper() == "GET":
+                    async with session.get(url, params=req_params, headers=req_headers, timeout=30) as resp:
+                        if resp.status in (429, 500, 502, 503, 504):
+                            await asyncio.sleep(1.5)
+                            continue
 
-                    if direction == "from" and from_addr != address:
-                        continue
+                        resp.raise_for_status()
+                        data = await resp.json()
 
-                    amount = int.from_bytes(
-                        bytes.fromhex(log.get("data", "0x").replace("0x", "")),
-                        "big",
-                    )
+                else:
+                    async with session.post(url, json=req_json, headers=req_headers, timeout=30) as resp:
+                        if resp.status in (429, 500, 502, 503, 504):
+                            await asyncio.sleep(1.5)
+                            continue
 
-                    transfers.append(
-                        {
-                            "tx_hash": tx_hash,
-                            "token_address": contract_address,
-                            "from": from_addr,
-                            "to": to_addr,
-                            "amount_raw": amount,
-                            "value_wei": amount,
-                            "block_number": _hex_to_int(log.get("blockNumber")),
-                            "blockNumber": _hex_to_int(log.get("blockNumber")),
-                        }
-                    )
-                except Exception:
-                    continue
+                        resp.raise_for_status()
+                        data = await resp.json()
 
-        return transfers
+                if self.service in ("etherscan", "bscscan"):
+                    if data.get("status") == "0":
+                        message = str(data.get("message", "")).lower()
+                        result = str(data.get("result", "")).lower()
+
+                        if message in ("no transactions found", "no records found") or "no records found" in result:
+                            return {"status": "1", "message": "OK", "result": []}
+
+                        if "limit" in message or "limit" in result or "rate limit" in result:
+                            await asyncio.sleep(1)
+                            continue
+
+                        raise Exception(f"{self.service} Error: {data.get('message')} {data.get('result')}")
+
+                return data
+
+            except RateLimitExceeded:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.debug("%s request error: %s", self.service, e)
+                await asyncio.sleep(1)
+                continue
+
+        raise Exception(f"Все попытки запроса к {self.service} исчерпаны")
 
 
 class EVMExplorerClient:
-    """
-    Etherscan API V2 client.
-    Работает для Ethereum chain_id=1 и BSC chain_id=56.
-    """
+    BASE_URL = "https://api.etherscan.io/v2/api"
 
-    BASE_V2_URL = "https://api.etherscan.io/v2/api"
+    def __init__(self, chain_id: int = 1, delay: float = 0.22):
+        self.chain_id = chain_id
+        self.delay = delay
+        self.rotator = APIKeyRotator("etherscan", ETHERSCAN_API_KEYS, delay=delay)
 
-    def __init__(self, chain_id: int, weth: str, api_keys: List[str] = None):
-        self.chain_id = int(chain_id)
-        self.weth = (weth or "").lower()
-        self.api_keys = list(api_keys or [])
-        self.service_name = "etherscan" if chain_id == 1 else "bscscan"
-
-    async def _request_page_raw(
-        self,
-        session,
-        action: str,
-        params: Dict[str, Any],
-        page: int,
-        offset: int,
-    ) -> Any:
-        if not self.api_keys:
-            raise RuntimeError("Explorer API keys не заданы")
-
-        for key_index, key in enumerate(self.api_keys):
-            request_params = {
-                "chainid": self.chain_id,
-                "module": "account",
-                "action": action,
-                "page": page,
-                "offset": offset,
-                "sort": "asc",
-                "apikey": key,
-            }
-
-            request_params.update(params)
-
-            try:
-                async with session.get(
-                    self.BASE_V2_URL,
-                    params=request_params,
-                    timeout=20,
-                ) as resp:
-                    if resp.status != 200:
-                        continue
-
-                    data = await resp.json()
-                    result = data.get("result")
-
-                    if isinstance(result, str):
-                        lower = result.lower()
-
-                        if "no transactions" in lower or "no records found" in lower:
-                            return []
-
-                        if "rate limit" in lower or "max rate limit" in lower:
-                            await asyncio.sleep(2)
-                            continue
-
-                        raise RuntimeError(result)
-
-                    from bot.database import increment_api_usage
-
-                    increment_api_usage(self.service_name, key_index)
-
-                    return result
-
-            except asyncio.TimeoutError:
-                await asyncio.sleep(1)
-                continue
-
-            except Exception:
-                await asyncio.sleep(1)
-                continue
-
-        raise RuntimeError(f"Explorer API не ответил: {self.service_name}/{action}")
-
-    async def _request_page(
-        self,
-        session,
-        action: str,
-        params: Dict[str, Any],
-        page: int,
-        offset: int,
-    ) -> List[Dict[str, Any]]:
-        result = await self._request_page_raw(
-            session,
-            action,
-            params,
-            page,
-            offset,
-        )
-
-        if isinstance(result, list):
-            return result
-
-        return []
-
-    async def _request_all_pages(
-        self,
-        session,
-        action: str,
-        params: Dict[str, Any],
-        offset: int = 10_000,
-    ) -> List[Dict[str, Any]]:
-        result = []
-        page = 1
-
-        while True:
-            chunk = await self._request_page(
-                session,
-                action,
-                params,
-                page=page,
-                offset=offset,
-            )
-
-            if not chunk:
-                break
-
-            result.extend(chunk)
-            page += 1
-
-            if len(chunk) < offset:
-                break
-
-            if len(result) >= 100_000:
-                break
-
-        return result
-
-    async def get_block_by_timestamp(self, session, timestamp: int) -> int:
-        result = await self._request_page_raw(
-            session,
-            "getblocknobytime",
-            {
-                "timestamp": int(timestamp),
-                "closest": "before",
-            },
-            page=1,
-            offset=1,
-        )
-
-        if isinstance(result, str):
-            try:
-                return int(result)
-            except Exception:
-                return 0
-
-        if isinstance(result, list) and result:
-            try:
-                return int(result[0].get("blockNumber") or 0)
-            except Exception:
-                return 0
-
-        return 0
-
-    async def get_token_transfers(
-        self,
-        session,
-        address: str,
-        start_block: int,
-        end_block: int,
-        filter_by: str = None,
-        contract_address: str = None,
-    ) -> List[Dict[str, Any]]:
+    async def get_block_by_timestamp(self, session: aiohttp.ClientSession, timestamp: int) -> int:
         params = {
-            "address": address,
-            "startblock": int(start_block),
-            "endblock": int(end_block),
+            "module": "block",
+            "action": "getblocknobytime",
+            "timestamp": timestamp,
+            "closest": "before",
         }
-
-        if contract_address:
-            params["contractaddress"] = contract_address
-
-        txs = await self._request_all_pages(
-            session,
-            "tokentx",
-            params,
-        )
-
-        filtered = []
-
-        for tx in txs:
-            if filter_by == "to" and str(tx.get("to", "")).lower() != address.lower():
-                continue
-
-            if filter_by == "from" and str(tx.get("from", "")).lower() != address.lower():
-                continue
-
-            filtered.append(tx)
-
-        return filtered
+        data = await self.rotator.make_request(session, "GET", self.BASE_URL, params=params)
+        return int(data["result"])
 
     async def get_normal_transactions(
         self,
-        session,
+        session: aiohttp.ClientSession,
         address: str,
         start_block: int,
         end_block: int,
-    ) -> List[Dict[str, Any]]:
-        return await self._request_all_pages(
-            session,
-            "txlist",
-            {
+        filter_by_from: bool = False,
+    ) -> List[Dict]:
+        all_txs = []
+        page = 1
+
+        while True:
+            params = {
+                "module": "account",
+                "action": "txlist",
                 "address": address,
-                "startblock": int(start_block),
-                "endblock": int(end_block),
-            },
-        )
+                "startblock": start_block,
+                "endblock": end_block,
+                "page": page,
+                "offset": 1000,
+                "sort": "asc",
+            }
+            data = await self.rotator.make_request(session, "GET", self.BASE_URL, params=params)
+            txs = data.get("result", [])
+
+            if not txs:
+                break
+
+            all_txs.extend(txs)
+
+            if len(txs) < 1000:
+                break
+
+            page += 1
+
+        if filter_by_from:
+            all_txs = [tx for tx in all_txs if tx.get("from", "").lower() == address.lower()]
+
+        return all_txs
 
     async def get_internal_transactions(
         self,
-        session,
+        session: aiohttp.ClientSession,
         address: str,
         start_block: int,
         end_block: int,
-    ) -> List[Dict[str, Any]]:
-        return await self._request_all_pages(
-            session,
-            "txlistinternal",
-            {
+        filter_by_from: bool = False,
+    ) -> List[Dict]:
+        all_txs = []
+        page = 1
+
+        while True:
+            params = {
+                "module": "account",
+                "action": "txlistinternal",
                 "address": address,
-                "startblock": int(start_block),
-                "endblock": int(end_block),
-            },
-        )
+                "startblock": start_block,
+                "endblock": end_block,
+                "page": page,
+                "offset": 1000,
+                "sort": "asc",
+            }
+            data = await self.rotator.make_request(session, "GET", self.BASE_URL, params=params)
+            txs = data.get("result", [])
 
-    async def get_account_balance(self, session, address: str) -> float:
-        result = await self._request_page_raw(
-            session,
-            "balance",
-            {
+            if not txs:
+                break
+
+            all_txs.extend(txs)
+
+            if len(txs) < 1000:
+                break
+
+            page += 1
+
+        if filter_by_from:
+            all_txs = [tx for tx in all_txs if tx.get("from", "").lower() == address.lower()]
+
+        return all_txs
+
+    async def get_token_transfers(
+        self,
+        session: aiohttp.ClientSession,
+        address: str,
+        contract_address: Optional[str] = None,
+        start_block: int = 0,
+        end_block: int = 99999999,
+        filter_by: Optional[str] = None,
+    ) -> List[Dict]:
+        all_txs = []
+        page = 1
+
+        while True:
+            params = {
+                "module": "account",
+                "action": "tokentx",
                 "address": address,
-            },
-            page=1,
-            offset=1,
-        )
+                "startblock": start_block,
+                "endblock": end_block,
+                "page": page,
+                "offset": 1000,
+                "sort": "asc",
+            }
 
-        if isinstance(result, str):
-            try:
-                return float(result) / 10**18
-            except Exception:
-                return 0.0
+            if contract_address:
+                params["contractaddress"] = contract_address
 
-        return 0.0
+            data = await self.rotator.make_request(session, "GET", self.BASE_URL, params=params)
+            txs = data.get("result", [])
+
+            if not txs:
+                break
+
+            all_txs.extend(txs)
+
+            if len(txs) < 1000:
+                break
+
+            page += 1
+
+        if filter_by:
+            all_txs = [tx for tx in all_txs if tx.get(filter_by, "").lower() == address.lower()]
+
+        return all_txs
 
 
-class BscScanExplorerClient(EVMExplorerClient):
-    def __init__(self, chain_id: int = 56, weth: str = None, api_keys: List[str] = None):
-        super().__init__(
-            chain_id=chain_id,
-            weth=weth or "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
-            api_keys=api_keys or [],
-        )
+class BscScanClient:
+    BASE_URL = "https://api.bscscan.com/api"
 
+    def __init__(self, delay: float = 0.22):
+        self.delay = delay
+        self.rotator = APIKeyRotator("bscscan", BSCSCAN_API_KEYS, delay=delay)
 
-class MoralisClient:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
+    async def get_block_by_timestamp(self, session: aiohttp.ClientSession, timestamp: int) -> int:
+        params = {
+            "module": "block",
+            "action": "getblocknobytime",
+            "timestamp": timestamp,
+            "closest": "before",
+        }
+        data = await self.rotator.make_request(session, "GET", self.BASE_URL, params=params)
+        return int(data["result"])
 
-    async def get_balances(self, session, address: str, chain: str = "eth") -> List[Dict[str, Any]]:
-        if not self.api_key:
-            return []
+    async def get_normal_transactions(
+        self,
+        session: aiohttp.ClientSession,
+        address: str,
+        start_block: int,
+        end_block: int,
+        filter_by_from: bool = False,
+    ) -> List[Dict]:
+        all_txs = []
+        page = 1
 
-        url = f"https://deep-index.moralis.io/api/v2/{address}/erc20"
+        while True:
+            params = {
+                "module": "account",
+                "action": "txlist",
+                "address": address,
+                "startblock": start_block,
+                "endblock": end_block,
+                "page": page,
+                "offset": 1000,
+                "sort": "asc",
+            }
+            data = await self.rotator.make_request(session, "GET", self.BASE_URL, params=params)
+            txs = data.get("result", [])
 
-        try:
-            async with session.get(
-                url,
-                params={"chain": chain},
-                headers={"X-API-Key": self.api_key},
-                timeout=20,
-            ) as resp:
-                if resp.status != 200:
-                    return []
+            if not txs:
+                break
 
-                data = await resp.json()
-                result = []
+            all_txs.extend(txs)
 
-                for item in data or []:
-                    decimals = int(item.get("decimals") or item.get("tokenDecimal") or 0)
-                    balance_raw = item.get("balance") or 0
+            if len(txs) < 1000:
+                break
 
-                    try:
-                        balance = int(balance_raw) / (10**decimals)
-                    except Exception:
-                        balance = 0.0
+            page += 1
 
-                    usd_price = float(item.get("usd_price") or item.get("usdPrice") or 0)
+        if filter_by_from:
+            all_txs = [tx for tx in all_txs if tx.get("from", "").lower() == address.lower()]
 
-                    result.append(
-                        {
-                            "contract_address": str(
-                                item.get("token_address") or item.get("address") or ""
-                            ).lower(),
-                            "symbol": item.get("symbol") or "?",
-                            "balance_formatted": balance,
-                            "decimals": decimals,
-                            "tokenDecimal": decimals,
-                            "balance": balance_raw,
-                            "usd_value": balance * usd_price,
-                        }
-                    )
+        return all_txs
 
-                return result
+    async def get_internal_transactions(
+        self,
+        session: aiohttp.ClientSession,
+        address: str,
+        start_block: int,
+        end_block: int,
+        filter_by_from: bool = False,
+    ) -> List[Dict]:
+        all_txs = []
+        page = 1
 
-        except Exception as exc:
-            logger.warning("Moralis balances error: %s", exc)
-            return []
+        while True:
+            params = {
+                "module": "account",
+                "action": "txlistinternal",
+                "address": address,
+                "startblock": start_block,
+                "endblock": end_block,
+                "page": page,
+                "offset": 1000,
+                "sort": "asc",
+            }
+            data = await self.rotator.make_request(session, "GET", self.BASE_URL, params=params)
+            txs = data.get("result", [])
+
+            if not txs:
+                break
+
+            all_txs.extend(txs)
+
+            if len(txs) < 1000:
+                break
+
+            page += 1
+
+        if filter_by_from:
+            all_txs = [tx for tx in all_txs if tx.get("from", "").lower() == address.lower()]
+
+        return all_txs
+
+    async def get_token_transfers(
+        self,
+        session: aiohttp.ClientSession,
+        address: str,
+        contract_address: Optional[str] = None,
+        start_block: int = 0,
+        end_block: int = 99999999,
+        filter_by: Optional[str] = None,
+    ) -> List[Dict]:
+        all_txs = []
+        page = 1
+
+        while True:
+            params = {
+                "module": "account",
+                "action": "tokentx",
+                "address": address,
+                "startblock": start_block,
+                "endblock": end_block,
+                "page": page,
+                "offset": 1000,
+                "sort": "asc",
+            }
+
+            if contract_address:
+                params["contractaddress"] = contract_address
+
+            data = await self.rotator.make_request(session, "GET", self.BASE_URL, params=params)
+            txs = data.get("result", [])
+
+            if not txs:
+                break
+
+            all_txs.extend(txs)
+
+            if len(txs) < 1000:
+                break
+
+            page += 1
+
+        if filter_by:
+            all_txs = [tx for tx in all_txs if tx.get(filter_by, "").lower() == address.lower()]
+
+        return all_txs
 
 
 class AnkrClient:
@@ -566,330 +408,140 @@ class AnkrClient:
 
     async def get_multichain_balances(
         self,
-        session,
+        session: aiohttp.ClientSession,
         address: str,
-        chains: List[str],
-    ) -> Dict[str, Any]:
+        chains: Optional[List[str]] = None,
+    ) -> Dict:
         if not self.api_url:
-            return {"assets": []}
+            return {}
 
-        assets = []
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "ankr_getAccountBalance",
+            "params": {
+                "blockchain": chains or ["eth", "bsc"],
+                "walletAddress": address,
+            },
+            "id": 1,
+        }
 
-        for chain in chains:
-            payload = {
-                "jsonrpc": "2.0",
-                "method": "ankr_getAccountBalance",
-                "params": {
-                    "wallet": address,
-                    "chain": chain,
-                },
-                "id": 1,
-            }
-
-            try:
-                async with session.post(self.api_url, json=payload, timeout=20) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        result = data.get("result") or {}
-
-                        for item in result.get("assets", []) or []:
-                            item["blockchain"] = chain
-                            assets.append(item)
-
-            except Exception as exc:
-                logger.warning("Ankr balances error chain=%s: %s", chain, exc)
-
-        return {"assets": assets}
-
-
-class DexScreenerPrice:
-    async def get_pairs(self, session, address: str) -> List[Dict[str, Any]]:
         try:
-            async with session.get(
-                f"https://api.dexscreener.com/latest/dex/tokens/{address}",
-                timeout=8,
-            ) as resp:
+            RateLimitTracker.require("ankr", 0)
+            async with session.post(self.api_url, json=payload, timeout=20) as resp:
                 if resp.status != 200:
-                    return []
-
+                    logger.warning("Ankr HTTP %s", resp.status)
+                    return {}
                 data = await resp.json()
-                return data.get("pairs") or []
+                if "error" in data:
+                    logger.warning("Ankr RPC error: %s", data.get("error"))
+                    return {}
+                return data.get("result", {})
+        except RateLimitExceeded:
+            raise
+        except Exception as e:
+            logger.debug("Ankr API error: %s", e)
+            return {}
 
-        except Exception as exc:
-            logger.debug("DexScreener get_pairs error: %s", exc)
+
+class MoralisClient:
+    BASE_URL = "https://deep-index.moralis.io/api/v2.2"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.headers = {"X-API-Key": api_key} if api_key else {}
+
+    async def get_balances(self, session: aiohttp.ClientSession, address: str, chain: str = "eth") -> List[Dict]:
+        if not self.api_key:
             return []
 
+        result = []
+        page = 1
+        page_size = 100
 
-async def _dexscreener_pair(session, address: str, network: str):
-    chain_map = {
-        "ethereum": "ethereum",
-        "eth": "ethereum",
-        "bsc": "bsc",
-        "bnb": "bsc",
-        "binance-smart-chain": "bsc",
-    }
+        while True:
+            try:
+                RateLimitTracker.require("moralis", 0)
+                url = f"{self.BASE_URL}/wallets/{address}/tokens"
+                params = {
+                    "chain": chain,
+                    "exclude_spam": "true",
+                    "page": page,
+                    "page_size": page_size,
+                }
 
-    chain = chain_map.get((network or "").lower(), (network or "").lower())
+                async with session.get(url, params=params, headers=self.headers, timeout=30) as resp:
+                    if resp.status != 200:
+                        logger.debug("Moralis HTTP %s", resp.status)
+                        break
 
-    try:
-        async with session.get(
-            f"https://api.dexscreener.com/latest/dex/tokens/{address}",
-            timeout=8,
-        ) as resp:
-            if resp.status != 200:
-                return None
+                    data = await resp.json()
+                    page_result = data.get("result", [])
+                    result.extend(page_result)
 
-            data = await resp.json()
-            pairs = data.get("pairs") or []
+                    total = data.get("total", 0) or 0
+                    if len(result) >= total or len(page_result) < page_size:
+                        break
 
-            if not pairs:
-                return None
+                    page += 1
 
-            if chain:
-                filtered = [
-                    pair
-                    for pair in pairs
-                    if str(pair.get("chainId", "")).lower() == chain
-                ]
-
-                if filtered:
-                    pairs = filtered
-
-            if not pairs:
-                return None
-
-            return max(
-                pairs,
-                key=lambda pair: float(
-                    pair.get("liquidity", {}).get("usd", 0) or 0
-                ),
-            )
-
-    except Exception as exc:
-        logger.debug("DexScreener pair error for %s: %s", address, exc)
-        return None
-
-
-async def get_dexscreener_price(
-    session,
-    address: str,
-    network: str,
-) -> Optional[float]:
-    pair = await _dexscreener_pair(session, address, network)
-
-    if not pair:
-        return None
-
-    try:
-        price = float(pair.get("priceUsd") or 0)
-    except Exception:
-        return None
-
-    return price if price > 0 else None
-
-
-async def get_geckoterminal_price(
-    session,
-    address: str,
-    network: str,
-) -> Optional[float]:
-    network_map = {
-        "ethereum": "ethereum",
-        "eth": "ethereum",
-        "bsc": "bsc",
-        "bnb": "bsc",
-        "binance-smart-chain": "bsc",
-    }
-
-    network_slug = network_map.get((network or "").lower(), (network or "").lower())
-
-    try:
-        async with session.get(
-            f"https://api.geckoterminal.com/api/v2/networks/{network_slug}/tokens/{address}",
-            timeout=8,
-        ) as resp:
-            if resp.status != 200:
-                return None
-
-            data = await resp.json()
-            attrs = data.get("data", {}).get("attributes", {})
-            price = float(attrs.get("price_usd") or 0)
-
-            return price if price > 0 else None
-
-    except Exception as exc:
-        logger.debug("GeckoTerminal price error for %s: %s", address, exc)
-        return None
-
-
-async def get_token_meta_cascade(
-    session,
-    address: str,
-    network: str,
-    rpc_url: str = None,
-) -> Dict[str, Any]:
-    result = {
-        "symbol": "?",
-        "name": "?",
-        "price_usd": None,
-        "source": None,
-    }
-
-    pair = await _dexscreener_pair(session, address, network)
-
-    if pair:
-        base = pair.get("baseToken", {}) or {}
-
-        result.update(
-            {
-                "symbol": base.get("symbol") or "?",
-                "name": base.get("name") or "?",
-                "source": "dexscreener",
-            }
-        )
-
-        try:
-            price = float(pair.get("priceUsd") or 0)
-            result["price_usd"] = price if price > 0 else None
-        except Exception:
-            pass
-
-    if result["price_usd"] is None:
-        result["price_usd"] = await get_geckoterminal_price(
-            session,
-            address,
-            network,
-        )
-
-        if result["price_usd"] is not None:
-            result["source"] = "geckoterminal"
-
-    if rpc_url:
-        try:
-            symbol = await TokenInfoService.get_symbol(
-                session,
-                address,
-                rpc_url,
-            )
-
-            if symbol:
-                result["symbol"] = symbol
-        except Exception:
-            pass
-
-        try:
-            name = await TokenInfoService.get_name(
-                session,
-                address,
-                rpc_url,
-            )
-
-            if name:
-                result["name"] = name
-        except Exception:
-            pass
-
-    return result
-
-
-async def get_evm_token_symbols(
-    session,
-    tokens: List[str],
-    network: str,
-    rpc_url: str,
-) -> Dict[str, Dict[str, Any]]:
-    result = {}
-
-    unique_tokens = list(
-        dict.fromkeys(
-            [
-                str(token).lower()
-                for token in tokens
-                if str(token)
-            ]
-        )
-    )[:100]
-
-    for token in unique_tokens:
-        result[token] = await get_token_meta_cascade(
-            session,
-            token,
-            network,
-            rpc_url,
-        )
-
-        await asyncio.sleep(0.02)
-
-    return result
-
-
-class EVMPriceCascade:
-    def __init__(self, web3_client: EVMWeb3Client):
-        self.web3_client = web3_client
-
-    async def get_price(self, session, token_address: str, network: str) -> Optional[float]:
-        price = await get_dexscreener_price(session, token_address, network)
-
-        if price is not None:
-            return price
-
-        return await get_geckoterminal_price(session, token_address, network)
-
-
-class CascadePriceFetcher:
-    def __init__(self, helius: Any = None):
-        self.helius = helius
-
-    async def get_prices(
-        self,
-        session,
-        addresses: List[str],
-        network: str,
-    ) -> Dict[str, float]:
-        result = {}
-
-        for address in addresses:
-            price = await get_dexscreener_price(session, address, network)
-
-            if price is None:
-                price = await get_geckoterminal_price(session, address, network)
-
-            if price:
-                result[address] = price
-
-            await asyncio.sleep(0.05)
+            except RateLimitExceeded:
+                raise
+            except Exception as e:
+                logger.debug("Moralis balances error: %s", e)
+                break
 
         return result
 
 
-class HeliusClient:
-    BASE_URL = "https://api.helius.xyz/v1"
-    RPC_URL = "https://mainnet.helius-rpc.com"
-    NATIVE_SOL_MINT = "So11111111111111111111111111111111111111111"
-    TOKEN_PROGRAMS = [
-        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-        "TokenzQdBNbLqP5VEhdkAS6EPFjc8R9fJzCPNQ6KTUu",
-    ]
-
+class AlchemyClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
 
-        if api_key:
-            self.rpc_url = f"{self.RPC_URL}/?api-key={api_key}"
-        else:
-            self.rpc_url = self.RPC_URL
+    async def get_token_balances(self, session: aiohttp.ClientSession, address: str) -> List[Dict]:
+        if not self.api_key:
+            return []
 
-        self._semaphore = asyncio.Semaphore(8)
+        url = f"https://eth-mainnet.g.alchemy.com/v2/{self.api_key}"
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "alchemy_getTokenBalances",
+            "params": [address, "erc20"],
+            "id": 1,
+        }
 
-    async def _do_request(
-        self,
-        session,
-        method: str,
-        params: list,
-    ) -> Any:
+        try:
+            RateLimitTracker.require("alchemy", 0)
+            async with session.post(url, json=payload, timeout=30) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+                balances = data.get("result", {}).get("tokenBalances", [])
+                return [
+                    item
+                    for item in balances
+                    if item.get("tokenBalance")
+                    and item.get("tokenBalance") != "0x0000000000000000000000000000000000000000000000000000000000000000"
+                ]
+        except RateLimitExceeded:
+            raise
+        except Exception as e:
+            logger.debug("Alchemy token balances error: %s", e)
+            return []
+
+
+class HeliusClient:
+    RPC_URL = "https://mainnet.helius-rpc.com"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self._semaphore = asyncio.Semaphore(5)
+
+    async def _do_request(self, session: aiohttp.ClientSession, method: str, params: list) -> Any:
+        if not self.api_key:
+            return None
+
         async with self._semaphore:
-            await asyncio.sleep(0.15)
-
+            await asyncio.sleep(0.25)
             payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -898,208 +550,58 @@ class HeliusClient:
             }
 
             try:
-                async with session.post(self.rpc_url, json=payload, timeout=20) as resp:
-                    if resp.status == 200:
-                        from bot.database import increment_api_usage
+                RateLimitTracker.require("helius", 0)
+                async with session.post(
+                    f"{self.RPC_URL}/?api-key={self.api_key}",
+                    json=payload,
+                    timeout=20,
+                ) as resp:
+                    if resp.status != 200:
+                        logger.debug("Helius HTTP %s", resp.status)
+                        return None
+                    data = await resp.json()
+                    if "error" in data:
+                        logger.debug("Helius RPC error: %s", data.get("error"))
+                        return None
+                    return data.get("result")
+            except RateLimitExceeded:
+                raise
+            except Exception as e:
+                logger.debug("Helius RPC error: %s", e)
+                return None
 
-                        increment_api_usage("helius", 0)
-                        return (await resp.json()).get("result")
-            except Exception as exc:
-                logger.debug("Helius RPC error method=%s: %s", method, exc)
-
-            return None
-
-    async def _get_wallet_balances_rest_metadata(
-        self,
-        session,
-        address: str,
-    ) -> Dict[str, Dict[str, Any]]:
+    async def get_wallet_balances(self, session: aiohttp.ClientSession, address: str) -> Dict:
         if not self.api_key:
             return {}
 
-        url = f"{self.BASE_URL}/wallet/{address}/balances?api-key={self.api_key}"
-
         try:
-            async with session.get(url, timeout=20) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    metadata: Dict[str, Dict[str, Any]] = {}
-
-                    for token in data.get("balances", []) or []:
-                        mint = token.get("mint")
-
-                        if not mint:
-                            continue
-
-                        metadata[mint] = {
-                            "symbol": token.get("symbol"),
-                            "name": token.get("name"),
-                            "usdValue": token.get("usdValue"),
-                        }
-
-                    return metadata
-        except Exception as exc:
-            logger.debug("Helius REST metadata error: %s", exc)
-
-        return {}
-
-    async def get_wallet_balances(
-        self,
-        session,
-        address: str,
-    ) -> Dict[str, Any]:
-        if not address:
-            return {"balances": []}
-
-        balances_by_mint: Dict[str, Dict[str, Any]] = {}
-
-        native_balance = await self._do_request(
-            session,
-            "getBalance",
-            [
-                address,
-                "confirmed",
-            ],
-        )
-
-        if isinstance(native_balance, dict):
-            native_balance = native_balance.get("value")
-
-        try:
-            native_ui = float(native_balance or 0) / 10**9
-        except Exception:
-            native_ui = 0.0
-
-        if native_ui > 0:
-            balances_by_mint[self.NATIVE_SOL_MINT] = {
-                "mint": self.NATIVE_SOL_MINT,
-                "symbol": "SOL",
-                "name": "Solana",
-                "balance": native_ui,
-                "rawAmount": int(native_ui * 10**9),
-                "decimals": 9,
-                "usdValue": None,
-            }
-
-        for program_id in self.TOKEN_PROGRAMS:
-            try:
-                result = await self._do_request(
-                    session,
-                    "getTokenAccountsByOwner",
-                    [
-                        address,
-                        {
-                            "programId": program_id,
-                        },
-                        {
-                            "encoding": "jsonParsed",
-                            "commitment": "confirmed",
-                        },
-                    ],
-                )
-
-                if not result:
-                    continue
-
-                for item in result.get("value", []) or []:
-                    try:
-                        parsed = item.get("account", {}).get("data", {}).get("parsed", {})
-
-                        if parsed.get("type") != "account":
-                            continue
-
-                        info = parsed.get("info", {})
-                        mint = info.get("mint")
-
-                        if not mint:
-                            continue
-
-                        token_amount = info.get("tokenAmount", {}) or {}
-                        raw_amount = int(token_amount.get("rawAmount") or 0)
-                        decimals = int(token_amount.get("decimals") or 0)
-
-                        if raw_amount <= 0:
-                            continue
-
-                        ui_amount = raw_amount / (10**decimals)
-
-                        current = balances_by_mint.get(mint)
-
-                        if current:
-                            current["rawAmount"] = int(current.get("rawAmount") or 0) + raw_amount
-                            current["balance"] = float(current.get("balance") or 0) + ui_amount
-                            current["decimals"] = decimals
-                        else:
-                            balances_by_mint[mint] = {
-                                "mint": mint,
-                                "symbol": "?",
-                                "name": "?",
-                                "balance": ui_amount,
-                                "rawAmount": raw_amount,
-                                "decimals": decimals,
-                                "usdValue": None,
-                            }
-
-                    except Exception as exc:
-                        logger.debug("Helius token account parse error: %s", exc)
-
-            except Exception as exc:
-                logger.error("Helius getTokenAccountsByOwner error program=%s: %s", program_id, exc)
-
-        metadata = await self._get_wallet_balances_rest_metadata(session, address)
-
-        balances = []
-
-        for mint, data in balances_by_mint.items():
-            meta = metadata.get(mint, {})
-
-            if meta.get("symbol"):
-                data["symbol"] = meta["symbol"]
-
-            if meta.get("name"):
-                data["name"] = meta["name"]
-
-            if meta.get("usdValue") is not None:
-                data["usdValue"] = meta["usdValue"]
-
-            balances.append(data)
-
-        balances.sort(
-            key=lambda item: (
-                float(item.get("usdValue") or 0)
-                if item.get("usdValue") is not None
-                else -1
-            ),
-            reverse=True,
-        )
-
-        return {
-            "balances": balances,
-            "nativeBalance": native_ui,
-        }
+            RateLimitTracker.require("helius", 0)
+            async with session.get(
+                f"https://api.helius.xyz/v1/wallets/{address}/balances?api-key={self.api_key}",
+                timeout=20,
+            ) as resp:
+                if resp.status != 200:
+                    return {}
+                return await resp.json()
+        except RateLimitExceeded:
+            raise
+        except Exception as e:
+            logger.debug("Helius wallet balances error: %s", e)
+            return {}
 
     async def get_signatures_for_address(
         self,
-        session,
+        session: aiohttp.ClientSession,
         address: str,
         limit: int = 100,
-    ) -> List[Dict[str, Any]]:
-        return await self._do_request(
-            session,
-            "getSignaturesForAddress",
-            [
-                address,
-                {
-                    "limit": int(limit),
-                },
-            ],
-        ) or []
+        before: Optional[str] = None,
+    ) -> List[Dict]:
+        params = [{"limit": min(limit, 1000)}]
+        if before:
+            params[0]["before"] = before
+        return await self._do_request(session, "getSignaturesForAddress", params) or []
 
-    async def get_transaction(
-        self,
-        session,
-        signature: str,
-    ) -> Dict[str, Any]:
+    async def get_transaction(self, session: aiohttp.ClientSession, signature: str) -> Dict:
         return await self._do_request(
             session,
             "getTransaction",
@@ -1111,3 +613,427 @@ class HeliusClient:
                 },
             ],
         ) or {}
+
+
+class DexScreenerPrice:
+    async def get_price(self, session: aiohttp.ClientSession, token_address: str) -> Optional[Dict]:
+        try:
+            RateLimitTracker.require("dexscreener", 0)
+            async with session.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+                timeout=10,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+
+                data = await resp.json()
+                pairs = data.get("pairs") or []
+
+                if not pairs:
+                    return None
+
+                best = max(
+                    pairs,
+                    key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0),
+                )
+
+                liquidity = float(best.get("liquidity", {}).get("usd", 0) or 0)
+                volume = float(best.get("volume", {}).get("h24", 0) or 0)
+                price = best.get("priceUsd")
+
+                return {
+                    "price_usd": float(price) if price else None,
+                    "liquidity_usd": liquidity,
+                    "volume_24h": volume,
+                    "source": "dexscreener",
+                }
+        except RateLimitExceeded:
+            raise
+        except Exception as e:
+            logger.debug("DexScreener price error for %s: %s", token_address, e)
+            return None
+
+
+class GeckoTerminalPrice:
+    async def get_price(
+        self,
+        session: aiohttp.ClientSession,
+        token_address: str,
+        network: str = "solana",
+    ) -> Optional[Dict]:
+        try:
+            RateLimitTracker.require("geckoterminal", 0)
+            async with session.get(
+                f"https://api.geckoterminal.com/api/v1/networks/{network}/tokens/{token_address}",
+                timeout=10,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+
+                data = await resp.json()
+                attrs = data.get("data", {}).get("attributes", {})
+                price = attrs.get("price_usd")
+
+                return {
+                    "price_usd": float(price) if price else None,
+                    "liquidity_usd": None,
+                    "volume_24h": None,
+                    "source": "geckoterminal",
+                }
+        except RateLimitExceeded:
+            raise
+        except Exception as e:
+            logger.debug("GeckoTerminal price error for %s: %s", token_address, e)
+            return None
+
+
+class JupiterPrice:
+    async def get_price(self, session: aiohttp.ClientSession, mint: str) -> Optional[Dict]:
+        try:
+            RateLimitTracker.require("jupiter", 0)
+            async with session.get(
+                f"https://price.jup.ag/v4/price?ids={mint}",
+                timeout=10,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+
+                data = await resp.json()
+                info = data.get("data", {}).get(mint)
+
+                if not info:
+                    return None
+
+                return {
+                    "price_usd": float(info.get("price", 0) or 0),
+                    "liquidity_usd": None,
+                    "volume_24h": None,
+                    "source": "jupiter",
+                }
+        except RateLimitExceeded:
+            raise
+        except Exception as e:
+            logger.debug("Jupiter price error for %s: %s", mint, e)
+            return None
+
+
+class BirdeyeTokenOverview:
+    async def get_overview(self, session: aiohttp.ClientSession, token_address: str) -> Optional[Dict]:
+        if not BIRDEYE_API_KEY:
+            return None
+
+        try:
+            RateLimitTracker.require("birdeye", 0)
+            headers = {"X-API-KEY": BIRDEYE_API_KEY}
+            async with session.get(
+                f"https://public-api.birdeye.so/defi/token_overview?address={token_address}&x-chain=solana",
+                headers=headers,
+                timeout=10,
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                return (await resp.json()).get("data", {})
+        except RateLimitExceeded:
+            raise
+        except Exception as e:
+            logger.debug("Birdeye overview error for %s: %s", token_address, e)
+            return None
+
+
+class EVMWeb3Client:
+    TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+    def __init__(
+        self,
+        rpc_url: str,
+        chain_id: int,
+        weth: Optional[str],
+        router: Optional[str] = None,
+        stable: Optional[str] = None,
+    ):
+        self.rpc_url = rpc_url
+        self.chain_id = chain_id
+        self.weth_address = weth.lower() if weth else None
+        self.router_address = router.lower() if router else None
+        self.stable_address = stable.lower() if stable else None
+
+    async def _rpc_call(self, session: aiohttp.ClientSession, method: str, params: list) -> Any:
+        RateLimitTracker.require("public_rpc", 0)
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": 1,
+        }
+
+        async with session.post(self.rpc_url, json=payload, timeout=15) as resp:
+            if resp.status != 200:
+                raise Exception(f"RPC HTTP {resp.status}")
+            data = await resp.json()
+            if "error" in data:
+                raise Exception(data["error"])
+            return data.get("result")
+
+    async def get_current_block(self, session: aiohttp.ClientSession) -> int:
+        return int(await self._rpc_call(session, "eth_blockNumber", []), 16)
+
+    async def get_block_by_number(self, session: aiohttp.ClientSession, block_number: int) -> Dict:
+        return await self._rpc_call(session, "eth_getBlockByNumber", [hex(block_number), False])
+
+    async def get_block_timestamp(self, session: aiohttp.ClientSession, block_number: int) -> int:
+        block = await self.get_block_by_number(session, block_number)
+        return int(block.get("timestamp", "0x0"), 16)
+
+    async def get_block_by_timestamp_binary_search(
+        self,
+        session: aiohttp.ClientSession,
+        target_timestamp: int,
+    ) -> int:
+        high = await self.get_current_block(session)
+        low = 0
+        best = 0
+
+        while low <= high:
+            mid = (low + high) // 2
+            ts = await self.get_block_timestamp(session, mid)
+
+            if ts <= target_timestamp:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+
+            await asyncio.sleep(0.03)
+
+        return best
+
+    async def get_balance_raw(self, session: aiohttp.ClientSession, address: str) -> int:
+        return int(await self._rpc_call(session, "eth_getBalance", [address, "latest"]), 16)
+
+    async def get_balance(self, session: aiohttp.ClientSession, address: str) -> float:
+        raw = await self.get_balance_raw(session, address)
+        return raw / 10**18
+
+    async def get_balance_at_block_raw(self, session: aiohttp.ClientSession, address: str, block_number: int) -> int:
+        return int(await self._rpc_call(session, "eth_getBalance", [address, hex(block_number)]), 16)
+
+    async def get_token_balance_at_block_raw(
+        self,
+        session: aiohttp.ClientSession,
+        token_address: str,
+        holder_address: str,
+        block_number: int,
+    ) -> int:
+        padded_holder = holder_address.lower()[2:].rjust(64, "0")
+        data = "0x70a08231" + padded_holder
+        result = await self._rpc_call(
+            session,
+            "eth_call",
+            [
+                {"to": token_address, "data": data},
+                hex(block_number),
+            ],
+        )
+        return int(result, 16) if result and result != "0x" else 0
+
+    async def get_transaction(self, session: aiohttp.ClientSession, tx_hash: str) -> Dict:
+        return await self._rpc_call(session, "eth_getTransactionByHash", [tx_hash]) or {}
+
+    async def get_transaction_receipt(self, session: aiohttp.ClientSession, tx_hash: str) -> Dict:
+        return await self._rpc_call(session, "eth_getTransactionReceipt", [tx_hash]) or {}
+
+    async def get_token_transfers(
+        self,
+        session: aiohttp.ClientSession,
+        address: str,
+        direction: str = "to",
+        from_block: int = 0,
+        to_block: int = 99999999,
+        chunk_size: int = 4999,
+    ) -> List[Dict]:
+        if to_block == "latest":
+            to_block = await self.get_current_block(session)
+
+        padded_addr = "0x000000000000000000000000" + address[2:].lower()
+
+        if direction == "to":
+            topics = [self.TRANSFER_TOPIC, None, padded_addr]
+        else:
+            topics = [self.TRANSFER_TOPIC, padded_addr]
+
+        results = []
+
+        for start_b in range(from_block, to_block + 1, chunk_size):
+            end_b = min(start_b + chunk_size - 1, to_block)
+            params = [
+                {
+                    "fromBlock": hex(start_b),
+                    "toBlock": hex(end_b),
+                    "topics": topics,
+                }
+            ]
+
+            try:
+                logs = await self._rpc_call(session, "eth_getLogs", params)
+
+                for log in logs:
+                    token_addr = log.get("address", "").lower()
+                    block_num = int(log.get("blockNumber", "0x0"), 16)
+                    tx_hash = log.get("transactionHash", "")
+                    value_hex = log.get("data", "0x0")
+                    value_wei = int(value_hex, 16) if value_hex and value_hex != "0x" else 0
+
+                    topics = log.get("topics", [])
+                    from_addr = ""
+                    to_addr = ""
+
+                    if len(topics) >= 2:
+                        from_addr = "0x" + topics[1][26:].lower()
+                    if len(topics) >= 3:
+                        to_addr = "0x" + topics[2][26:].lower()
+
+                    results.append(
+                        {
+                            "token_address": token_addr,
+                            "tx_hash": tx_hash,
+                            "block_number": block_num,
+                            "from": from_addr,
+                            "to": to_addr,
+                            "value": str(value_wei),
+                            "value_wei": value_wei,
+                        }
+                    )
+
+            except Exception as e:
+                logger.debug("RPC getLogs chunk failed %s-%s: %s", start_b, end_b, e)
+
+            await asyncio.sleep(0.05)
+
+        return results
+
+    async def get_price_via_router(
+        self,
+        session: aiohttp.ClientSession,
+        token_address: str,
+        weth_price_usd: float,
+    ) -> Optional[float]:
+        if not self.router_address or not self.weth_address or not weth_price_usd:
+            return None
+
+        try:
+            amount_in = "0000000000000000000000000000000000000000000000000de0b6b3a7640000"
+            offset = "0000000000000000000000000000000000000000000000000000000000000040"
+            length = "0000000000000000000000000000000000000000000000000000000000000002"
+            token = token_address.lower()[2:].rjust(64, "0")
+            weth = self.weth_address[2:].rjust(64, "0")
+            data = "0xd06ca61f" + amount_in + offset + length + token + weth
+
+            result = await self._rpc_call(
+                session,
+                "eth_call",
+                [
+                    {"to": self.router_address, "data": data},
+                    "latest",
+                ],
+            )
+
+            if not result or result == "0x":
+                return None
+
+            amounts_offset = int(result[2:66], 16)
+            weth_out = int(result[2 + amounts_offset + 64 * 2 :], 16)
+
+            if weth_out > 0:
+                return (weth_out / 10**18) * weth_price_usd
+
+        except Exception as e:
+            logger.debug("Router price failed for %s: %s", token_address, e)
+
+        return None
+
+
+class TokenInfoService:
+    @staticmethod
+    async def get_symbol(session: aiohttp.ClientSession, token_address: str, rpc_url: str) -> str:
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": token_address, "data": "0x95d89b41"}, "latest"],
+            "id": 1,
+        }
+
+        try:
+            RateLimitTracker.require("public_rpc", 0)
+            async with session.post(rpc_url, json=payload, timeout=10) as resp:
+                if resp.status != 200:
+                    return "?"
+                res_str = (await resp.json()).get("result", "")
+                return TokenInfoService._decode_string(res_str)
+        except Exception:
+            return "?"
+
+    @staticmethod
+    async def get_name(session: aiohttp.ClientSession, token_address: str, rpc_url: str) -> str:
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": token_address, "data": "0x06fdde03"}, "latest"],
+            "id": 1,
+        }
+
+        try:
+            RateLimitTracker.require("public_rpc", 0)
+            async with session.post(rpc_url, json=payload, timeout=10) as resp:
+                if resp.status != 200:
+                    return "?"
+                res_str = (await resp.json()).get("result", "")
+                return TokenInfoService._decode_string(res_str)
+        except Exception:
+            return "?"
+
+    @staticmethod
+    async def get_decimals(session: aiohttp.ClientSession, token_address: str, rpc_url: str) -> int:
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": token_address, "data": "0x313ce567"}, "latest"],
+            "id": 1,
+        }
+
+        try:
+            RateLimitTracker.require("public_rpc", 0)
+            async with session.post(rpc_url, json=payload, timeout=10) as resp:
+                if resp.status != 200:
+                    return 18
+                result = (await resp.json()).get("result")
+                if result and result != "0x":
+                    decimals = int(result, 16)
+                    if 0 <= decimals <= 36:
+                        return decimals
+        except Exception:
+            pass
+
+        return 18
+
+    @staticmethod
+    def _decode_string(res_str: str) -> str:
+        if not res_str or res_str == "0x":
+            return "?"
+
+        raw_hex = res_str[2:]
+
+        try:
+            if len(raw_hex) >= 128:
+                length = int(raw_hex[64:128], 16)
+                if 0 < length < 256:
+                    data = raw_hex[128 : 128 + (length * 2)]
+                    return bytes.fromhex(data).decode("utf-8", errors="ignore").strip()
+        except Exception:
+            pass
+
+        try:
+            symbol = bytes.fromhex(raw_hex).decode("utf-8", errors="ignore").replace("\x00", "").strip()
+            symbol = re.sub(r"[^A-Za-z0-9_$.-]", "", symbol)
+            return symbol or "?"
+        except Exception:
+            return "?"
