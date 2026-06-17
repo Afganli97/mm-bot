@@ -1,105 +1,86 @@
 """
-Главный модуль запуска Telegram-бота.
+Main bot entrypoint.
 """
-
 import logging
-from pathlib import Path
-
 from aiohttp import ClientSession
 from telegram.ext import ApplicationBuilder
 
-from bot.api_clients import AnkrClient, CascadePriceFetcher, HeliusClient, MoralisClient
+from bot.api_clients import AlchemyClient, AnkrClient, BscScanClient, HeliusClient, MoralisClient
 from bot.config import (
-    ANKR_API_KEY,
+    ALGORITHM_API_KEY if False else None,
+)
+from bot.config import (
+    ALchemy_API_KEY if False else None,
+)
+from bot.config import (
+    ALCH if False else None,
+)
+from bot.config import (
+    ALCHEMY_API_KEY,
     ANKR_API_URL,
+    BSCSCAN_API_KEYS,
     HELIUS_API_KEY,
     LOG_FILE,
     LOG_LEVEL,
     MORALIS_API_KEY,
     TELEGRAM_BOT_TOKEN,
 )
-from bot.database import init_db
+from bot.database import init_db, migrate_db
 from bot.handlers import register_handlers
-
-
-Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+from bot.rate_limits import RateLimitTracker
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=getattr(logging, LOG_LEVEL),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(),
-    ],
-    force=True,
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()],
 )
 
 logger = logging.getLogger(__name__)
 
 
 async def post_init(app):
-    session = None
+    init_db()
+    migrate_db()
 
-    try:
-        init_db()
+    session = ClientSession()
+    app.bot_data["session"] = session
+    app.bot_data["rate_limiter"] = RateLimitTracker()
 
-        session = ClientSession()
-        app.bot_data["session"] = session
+    app.bot_data["ankr"] = AnkrClient(ANKR_API_URL) if ANKR_API_URL else None
 
-        if ANKR_API_KEY:
-            app.bot_data["ankr"] = AnkrClient(ANKR_API_URL)
-        else:
-            app.bot_data["ankr"] = None
-            logger.warning("ANKR_API_KEY не задан. Мультичейн EVM-балансы будут неполными.")
-
-        helius = HeliusClient(HELIUS_API_KEY) if HELIUS_API_KEY else None
+    if HELIUS_API_KEY:
+        helius = HeliusClient(HELIUS_API_KEY)
         app.bot_data["helius"] = helius
+    else:
+        logger.warning("Helius API key не задан. Solana-балансы и Solana-history будут недоступны.")
+        app.bot_data["helius"] = None
 
-        app.bot_data["cascade"] = CascadePriceFetcher(helius)
+    if MORALIS_API_KEY:
+        app.bot_data["moralis"] = MoralisClient(MORALIS_API_KEY)
+    else:
+        logger.warning("Moralis API key не задан. Балансы будут собираться через остальные бесплатные источники.")
+        app.bot_data["moralis"] = None
 
-        if MORALIS_API_KEY:
-            app.bot_data["moralis"] = MoralisClient(MORALIS_API_KEY)
-        else:
-            app.bot_data["moralis"] = None
-            logger.warning("MORALIS_API_KEY не задан. Ethereum ERC20-балансы могут быть неполными.")
+    if ALCHEMY_API_KEY:
+        app.bot_data["alchemy"] = AlchemyClient(ALCHEMY_API_KEY)
+    else:
+        logger.warning("Alchemy API key не задан. Ethereum-балансы будут неполными без Moralis/Ankr.")
+        app.bot_data["alchemy"] = None
 
-        logger.info("Бот инициализирован")
+    app.bot_data["bscscan"] = BscScanClient() if BSCSCAN_API_KEYS else None
 
-    except Exception:
-        logger.exception("Ошибка инициализации бота")
-
-        if session:
-            await session.close()
-
-        raise
+    logger.info("Bot post_init completed")
 
 
 async def post_shutdown(app):
     session = app.bot_data.get("session")
-
     if session:
         await session.close()
-        logger.info("HTTP-сессия закрыта")
-
-
-async def error_handler(update, context):
-    error = context.error
-    logger.exception("Unhandled Telegram error: %s", error)
-
-    if update and getattr(update, "effective_chat", None):
-        try:
-            await context.bot.send_message(
-                update.effective_chat.id,
-                "⚠️ Ошибка обработки запроса. Попробуйте позже или отправьте команду /start.",
-                disable_notification=True,
-            )
-        except Exception:
-            logger.debug("Не удалось отправить ошибку пользователю", exc_info=True)
 
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        logger.critical("TELEGRAM_BOT_TOKEN не задан в .env")
+        logger.critical("Не задан TELEGRAM_BOT_TOKEN в .env")
         exit(1)
 
     application = (
@@ -111,8 +92,6 @@ def main():
     )
 
     register_handlers(application)
-    application.add_error_handler(error_handler)
-
     logger.info("Бот запущен")
     application.run_polling()
 
