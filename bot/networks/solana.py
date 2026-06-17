@@ -4,7 +4,7 @@ Solana network adapter.
 from typing import Dict, List
 
 from bot.api_clients import HeliusClient
-from bot.networks.base import BaseNetwork
+from bot.networks._base import BaseNetwork
 
 
 class SolanaNetwork(BaseNetwork):
