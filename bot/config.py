@@ -17,7 +17,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-_ALLOWED_user_ids = os.getenv("ALLOWED_USER_IDS", "")
+_allowed_user_ids = os.getenv("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS: Set[int] = {
     int(item.strip())
     for item in _Allowed_user_ids.split(",")
