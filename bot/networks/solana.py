@@ -1,66 +1,44 @@
 """
-Solana network stub.
-
-Сейчас Solana-балансы и история выполняются напрямую через:
-- HeliusClient;
-- SolanaTraversal.
-
-Файл оставлен для совместимости импортов и будущего расширения.
+Solana network adapter.
 """
+from typing import Dict, List
 
-import logging
-from typing import Dict, List, Optional
-
-from ._base import BaseNetwork
-
-
-logger = logging.getLogger(__name__)
+from bot.api_clients import HeliusClient
+from bot.networks.base import BaseNetwork
 
 
 class SolanaNetwork(BaseNetwork):
-    def __init__(self, network_config: Dict, session):
-        super().__init__(network_config, session)
+    def __init__(self, config: dict, session, helius: HeliusClient):
+        self._config = config
+        self.key = config["key"]
+        self._name = config["name"]
+        self._rpc_url = config["rpc_url"]
+        self._session = session
+        self.helius = helius
 
-    async def validate_address(self, address: str) -> bool:
-        try:
-            from solders.pubkey import Pubkey
+    @property
+    def name(self) -> str:
+        return self._name
 
-            Pubkey.from_string(address)
-            return True
-        except Exception:
-            return False
-
-    async def get_balance(self, address: str) -> float:
-        return 0.0
+    @property
+    def rpc_url(self) -> str:
+        return self._rpc_url
 
     async def get_block_by_timestamp(self, timestamp: int) -> int:
         return 0
 
-    async def get_incoming_buys(
-        self,
-        address: str,
-        start_block: int,
-        end_block: int,
-    ) -> List[Dict]:
+    async def get_incoming_buys(self, address: str, start_block: int, end_block: int) -> List[Dict]:
         return []
 
-    async def get_outgoing_transfers(
-        self,
-        address: str,
-        start_block: int,
-        end_block: int,
-    ) -> List[Dict]:
+    async def get_outgoing_related_transfers(self, address: str, start_block: int, end_block: int) -> List[Dict]:
         return []
 
-    async def get_token_balances(self, address: str) -> List[Dict]:
-        return []
+    async def get_transaction(self, tx_hash: str) -> Dict:
+        return await self.helius.get_transaction(self._session, tx_hash)
 
-    async def get_swap_history(
-        self,
-        address,
-        start_time,
-        end_time,
-        min_amount_native,
-        max_tokens,
-    ) -> List[Dict]:
-        return []
+    async def get_native_balance(self, address: str) -> float:
+        data = await self.helius.get_wallet_balances(self._session, address)
+        native = data.get("nativeBalance") or data.get("solBalance") or {}
+        if isinstance(native, dict):
+            return float(native.get("lamports", 0) or 0) / 10**9
+        return 0.0
