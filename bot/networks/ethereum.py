@@ -1,16 +1,16 @@
 """
 Ethereum network layer.
 
-Использует:
-- Etherscan V2 для истории;
-- EVM RPC для балансов и router price.
+История токенов берётся через Etherscan API.
 """
 
+import asyncio
 import logging
 from typing import Dict, List
 
 from ._base import BaseNetwork
 from bot.api_clients import EVMExplorerClient, EVMWeb3Client
+from bot.config import EVM_NETWORK_CALL_TIMEOUT_SECONDS
 
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,6 @@ class EthereumNetwork(BaseNetwork):
         web3_client: EVMWeb3Client = None,
     ):
         super().__init__(network_config, session)
-
         self.explorer = explorer_client
         self.web3 = web3_client
 
@@ -41,7 +40,10 @@ class EthereumNetwork(BaseNetwork):
         return await self.explorer.get_account_balance(self.session, address)
 
     async def get_block_by_timestamp(self, timestamp: int) -> int:
-        return await self.explorer.get_block_by_timestamp(self.session, timestamp)
+        return await asyncio.wait_for(
+            self.explorer.get_block_by_timestamp(self.session, timestamp),
+            timeout=EVM_NETWORK_CALL_TIMEOUT_SECONDS,
+        )
 
     async def get_incoming_buys(
         self,
@@ -49,35 +51,35 @@ class EthereumNetwork(BaseNetwork):
         start_block: int,
         end_block: int,
     ) -> List[Dict]:
-        txs = await self.explorer.get_token_transfers(
-            self.session,
-            address,
-            start_block=start_block,
-            end_block=end_block,
-            filter_by="to",
+        txs = await asyncio.wait_for(
+            self.explorer.get_token_transfers(
+                self.session,
+                address,
+                start_block=start_block,
+                end_block=end_block,
+                filter_by="to",
+            ),
+            timeout=EVM_NETWORK_CALL_TIMEOUT_SECONDS,
         )
 
-        buys: List[Dict] = []
+        result = []
 
         for tx in txs:
-            token_address = str(tx.get("contractAddress") or "").lower()
+            token = str(tx.get("contractAddress") or "").lower()
 
-            if not token_address:
+            if not token or token == self.config["weth"].lower():
                 continue
 
-            if token_address == self.config["weth"].lower():
-                continue
-
-            buys.append(
+            result.append(
                 {
-                    "token_address": token_address,
+                    "token_address": token,
                     "tx_hash": tx.get("hash") or tx.get("transactionHash") or "",
                     "block_number": int(tx.get("blockNumber") or 0),
                     "blockNumber": int(tx.get("blockNumber") or 0),
                 }
             )
 
-        return buys
+        return result
 
     async def get_outgoing_transfers(
         self,
@@ -85,30 +87,39 @@ class EthereumNetwork(BaseNetwork):
         start_block: int,
         end_block: int,
     ) -> List[Dict]:
-        normal_txs = await self.explorer.get_normal_transactions(
-            self.session,
-            address,
-            start_block,
-            end_block,
+        normal_txs = await asyncio.wait_for(
+            self.explorer.get_normal_transactions(
+                self.session,
+                address,
+                start_block,
+                end_block,
+            ),
+            timeout=EVM_NETWORK_CALL_TIMEOUT_SECONDS,
         )
 
-        internal_txs = await self.explorer.get_internal_transactions(
-            self.session,
-            address,
-            start_block,
-            end_block,
+        internal_txs = await asyncio.wait_for(
+            self.explorer.get_internal_transactions(
+                self.session,
+                address,
+                start_block,
+                end_block,
+            ),
+            timeout=EVM_NETWORK_CALL_TIMEOUT_SECONDS,
         )
 
-        weth_txs = await self.explorer.get_token_transfers(
-            self.session,
-            address,
-            contract_address=self.config["weth"],
-            start_block=start_block,
-            end_block=end_block,
-            filter_by="from",
+        weth_txs = await asyncio.wait_for(
+            self.explorer.get_token_transfers(
+                self.session,
+                address,
+                contract_address=self.config["weth"],
+                start_block=start_block,
+                end_block=end_block,
+                filter_by="from",
+            ),
+            timeout=EVM_NETWORK_CALL_TIMEOUT_SECONDS,
         )
 
-        transfers: List[Dict] = []
+        result = []
 
         for tx in normal_txs + internal_txs + weth_txs:
             to_addr = str(tx.get("to") or "").lower()
@@ -116,7 +127,7 @@ class EthereumNetwork(BaseNetwork):
             if not to_addr:
                 continue
 
-            transfers.append(
+            result.append(
                 {
                     "to": to_addr,
                     "value_wei": int(tx.get("value") or 0),
@@ -124,4 +135,4 @@ class EthereumNetwork(BaseNetwork):
                 }
             )
 
-        return transfers
+        return result
