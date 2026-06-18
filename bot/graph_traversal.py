@@ -8,7 +8,13 @@ from collections import Counter, deque
 from typing import Dict, List, Set
 
 from bot.blacklist import is_blacklisted
-from bot.config import DEFAULT_MAX_ADDRESSES, DEFAULT_MAX_BRANCHES, DEFAULT_MAX_DEPTH, DEFAULT_MAX_FOUND_TOKENS, DEFAULT_LOOKBACK_DAYS
+from bot.config import (
+    DEFAULT_MAX_ADDRESSES,
+    DEFAULT_MAX_BRANCHES,
+    DEFAULT_MAX_DEPTH,
+    DEFAULT_MAX_FOUND_TOKENS,
+    DEFAULT_LOOKBACK_DAYS,
+)
 from bot.database import (
     add_found_token,
     create_request,
@@ -117,7 +123,11 @@ class GraphTraversal:
 
                 if depth + 1 <= self.max_depth:
                     try:
-                        transfers = await self.network.get_outgoing_related_transfers(addr, self.start_block, self.end_block)
+                        transfers = await self.network.get_outgoing_related_transfers(
+                            addr,
+                            self.start_block,
+                            self.end_block,
+                        )
                         self.total_transactions += len(transfers)
 
                         related = self._aggregate_related_addresses(transfers)
@@ -149,10 +159,13 @@ class GraphTraversal:
                             queue.append((to_addr, depth + 1))
                             self.total_addresses += 1
                             branch_added += 1
-                            update_task_progress(self.request_id, processed_addresses=self.total_addresses)
+                            update_task_progress(
+                                self.request_id,
+                                processed_addresses=self.total_addresses,
+                            )
 
-                except Exception as e:
-                    logger.exception("Error processing related transfers for %s: %s", addr, e)
+                    except Exception as e:
+                        logger.exception("Error processing related transfers for %s: %s", addr, e)
 
                 update_task_progress(
                     self.request_id,
@@ -161,6 +174,7 @@ class GraphTraversal:
                 )
 
             update_request_status(self.request_id, "done", finished=True)
+
             logger.info(
                 "EVM traversal done. Addresses=%s txs=%s tokens=%s",
                 self.total_addresses,
@@ -172,8 +186,10 @@ class GraphTraversal:
 
         except Exception as e:
             logger.exception("Critical EVM traversal error")
+
             if self.request_id:
                 update_request_status(self.request_id, "error", str(e), finished=True)
+
             raise
 
     async def _process_buys(self, addr: str, buys: List[Dict]):
@@ -182,6 +198,7 @@ class GraphTraversal:
                 break
 
             token = (buy.get("token_address") or "").lower()
+
             if not token or token in self.unique_token_addresses:
                 continue
 
@@ -210,6 +227,7 @@ class GraphTraversal:
                 continue
 
             amount = raw_balance / (10**decimals)
+
             price = await self.price_service.get_price(
                 self.network.key,
                 token,
@@ -263,12 +281,13 @@ class GraphTraversal:
 
         for transfer in transfers:
             to_addr = transfer.get("to")
+
             if not to_addr:
                 continue
 
             to_addr = to_addr.lower()
 
-            if transfer.get("type") == "native":
+            if transfer.get("type") in ("native", "internal_native"):
                 counter[to_addr] += int(transfer.get("value_wei") or 0) + 1
             else:
                 counter[to_addr] += 1
