@@ -1,7 +1,7 @@
+# bot/utils/telegram.py
 """
 Telegram message helpers.
 """
-from html import escape
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 
@@ -11,9 +11,6 @@ async def send_long_message(bot, chat_id: int, text: str, parse_mode: str = None
 
     if not text:
         return
-
-    if parse_mode == "HTML":
-        text = escape(text)
 
     if len(text) <= TELEGRAM_MAX_MESSAGE_LENGTH:
         await bot.send_message(
