@@ -2,19 +2,11 @@
 Main bot entrypoint.
 """
 import logging
+
 from aiohttp import ClientSession
 from telegram.ext import ApplicationBuilder
 
 from bot.api_clients import AlchemyClient, AnkrClient, BscScanClient, HeliusClient, MoralisClient
-from bot.config import (
-    ALGORITHM_API_KEY if False else None,
-)
-from bot.config import (
-    ALchemy_API_KEY if False else None,
-)
-from bot.config import (
-    ALCH if False else None,
-)
 from bot.config import (
     ALCHEMY_API_KEY,
     ANKR_API_URL,
@@ -32,7 +24,10 @@ from bot.rate_limits import RateLimitTracker
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()],
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(),
+    ],
 )
 
 logger = logging.getLogger(__name__)
@@ -49,8 +44,7 @@ async def post_init(app):
     app.bot_data["ankr"] = AnkrClient(ANKR_API_URL) if ANKR_API_URL else None
 
     if HELIUS_API_KEY:
-        helius = HeliusClient(HELIUS_API_KEY)
-        app.bot_data["helius"] = helius
+        app.bot_data["helius"] = HeliusClient(HELIUS_API_KEY)
     else:
         logger.warning("Helius API key не задан. Solana-балансы и Solana-history будут недоступны.")
         app.bot_data["helius"] = None
