@@ -1,7 +1,9 @@
+# bot/handlers.py
 """
 Telegram handlers.
 """
 import logging
+from html import escape as html_escape
 from typing import Dict, List
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -54,6 +56,8 @@ from bot.utils.telegram import send_long_message
 
 logger = logging.getLogger(__name__)
 
+WSOL_MINT = "So11111111111111111111111111111111111111111"
+
 
 def _get_global_session(context: ContextTypes.DEFAULT_TYPE):
     session = context.application.bot_data.get("session")
@@ -74,6 +78,66 @@ def _check_access(update: Update) -> bool:
         return False
 
     return True
+
+
+def esc(value) -> str:
+    return html_escape(str(value), quote=True)
+
+
+def dexscreener_link(network: str, token_address: str) -> str:
+    network = network.lower()
+
+    if network == "solana":
+        return f"https://dexscreener.com/solana/{token_address}"
+
+    if network == "bsc":
+        return f"https://dexscreener.com/bsc/{token_address}"
+
+    if network == "ethereum":
+        return f"https://dexscreener.com/ethereum/{token_address}"
+
+    return f"https://dexscreener.com/{network}/{token_address}"
+
+
+def html_link(text: str, url: str) -> str:
+    return f'<a href="{esc(url)}">{esc(text)}</a>'
+
+
+def fmt_num(value) -> str:
+    try:
+        value = float(value)
+    except Exception:
+        return str(value)
+
+    if value == 0:
+        return "0"
+
+    if abs(value) >= 1_000_000:
+        return f"{value:,.0f}"
+
+    if abs(value) >= 1000:
+        return f"{value:,.2f}"
+
+    text = f"{value:.10f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def parse_int(value) -> int | None:
+    if value is None:
+        return None
+
+    if isinstance(value, int):
+        return value
+
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.lower().startswith("0x"):
+            return int(text, 16)
+        return int(float(text))
+    except Exception:
+        return None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -106,10 +170,9 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _check_access(update):
         return
 
-    rows = RateLimitTracker.get_dashboard_rows()
-
     from datetime import datetime, timezone
 
+    rows = RateLimitTracker.get_dashboard_rows()
     today = datetime.now(timezone.utc).date().isoformat()
 
     lines = [f"📊 API лимиты на сегодня ({today} UTC):"]
@@ -188,7 +251,7 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
 
     lines = [
         "💰 Мультичейн EVM Балансы",
-        f"Адрес: `{address}`",
+        f"Адрес: {esc(address)}",
     ]
 
     total_usd_portfolio = 0.0
@@ -209,7 +272,6 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
         chain_lines: List[str] = []
         chain_total = 0.0
 
-        # Native balance
         try:
             native_raw = await web3.get_balance_raw(session, address)
 
@@ -227,8 +289,10 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
                 if native_usd >= MIN_USD_VALUE or native_raw > 0:
                     chain_total += native_usd
                     display = f"≈ ${native_usd:,.2f}" if native_usd > 0 else "?"
+                    native_link = dexscreener_link(chain, conf["weth"])
                     chain_lines.append(
-                        f"• {conf['native_symbol']}: {native_balance:.8f} ({display})"
+                        f"• {html_link(conf['native_symbol'], native_link)}: "
+                        f"{fmt_num(native_balance)} ({display})"
                     )
 
         except Exception as e:
@@ -236,7 +300,6 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
 
         tokens: Dict[str, Dict] = {}
 
-        # Moralis balances
         try:
             if moralis:
                 moralis_tokens = await moralis.get_balances(
@@ -254,18 +317,11 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
                     if contract == "0x0000000000000000000000000000000000000000":
                         continue
 
-                    balance_raw = t.get("balance")
-                    balance_formatted = t.get("balance_formatted")
-
-                    try:
-                        raw = int(balance_raw)
-                    except Exception:
-                        raw = None
-
+                    raw = parse_int(t.get("balance"))
                     decimals = int(t.get("decimals") or 18)
 
                     try:
-                        balance = float(balance_formatted) if balance_formatted not in (None, "") else None
+                        balance = float(t.get("balance_formatted")) if t.get("balance_formatted") else None
                     except Exception:
                         balance = None
 
@@ -281,7 +337,6 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
         except Exception as e:
             logger.debug("Moralis balances error %s: %s", chain, e)
 
-        # Alchemy balances for Ethereum
         try:
             if alchemy and chain == "ethereum":
                 alchemy_tokens = await alchemy.get_token_balances(session, address)
@@ -295,9 +350,9 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
                     if contract in tokens:
                         continue
 
-                    raw = int(t.get("tokenBalance", "0x0"), 16)
+                    raw = parse_int(t.get("tokenBalance", "0x0"))
                     decimals = 18
-                    balance = raw / (10 ** decimals)
+                    balance = raw / (10**decimals) if raw is not None else None
 
                     tokens[contract] = {
                         "raw": raw,
@@ -311,7 +366,6 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
         except Exception as e:
             logger.debug("Alchemy balances error: %s", e)
 
-        # Ankr balances
         try:
             if ankr and ankr.api_url:
                 ankr_data = await ankr.get_multichain_balances(
@@ -332,13 +386,7 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
                     if contract in tokens:
                         continue
 
-                    raw_value = asset.get("balanceRaw") or asset.get("raw")
-
-                    try:
-                        raw = int(raw_value)
-                    except Exception:
-                        raw = None
-
+                    raw = parse_int(asset.get("balanceRaw") or asset.get("raw"))
                     decimals = int(asset.get("decimals") or 18)
 
                     try:
@@ -358,7 +406,6 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
         except Exception as e:
             logger.debug("Ankr balances error %s: %s", chain, e)
 
-        # Process all tokens
         for contract, token_data in list(tokens.items()):
             try:
                 metadata = await metadata_service.get_evm_metadata(
@@ -367,20 +414,24 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
                     conf["rpc_url"],
                 )
 
+                symbol = metadata.get("symbol") or token_data.get("symbol") or "?"
+                name = metadata.get("name") or token_data.get("name") or "?"
                 decimals = int(metadata.get("decimals") or token_data.get("decimals") or 18)
 
                 raw = token_data.get("raw")
 
                 if raw is None and token_data.get("balance") is not None:
-                    raw = int(float(token_data["balance"]) * (10 ** decimals))
+                    raw = int(float(token_data["balance"]) * (10**decimals))
 
                 spam = await spam_filter.is_spam(
                     network=chain,
                     token_address=contract,
-                    symbol=metadata.get("symbol") or token_data.get("symbol") or "?",
+                    symbol=symbol,
+                    name=name,
                     decimals=decimals,
                     raw_balance=raw,
                     is_native=False,
+                    strict=False,
                 )
 
                 if spam.get("is_spam"):
@@ -392,7 +443,7 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
                 balance = token_data.get("balance")
 
                 if balance is None and raw is not None:
-                    balance = raw / (10 ** decimals)
+                    balance = raw / (10**decimals)
 
                 usd_total = float(token_data.get("usd_val") or 0)
 
@@ -408,17 +459,19 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
 
                 token_usd = None
 
-                if price_usd and balance is not None:
+                if usd_total > 0:
+                    token_usd = usd_total
+                elif price_usd and balance is not None:
                     token_usd = float(balance) * float(price_usd)
+
+                if token_usd is not None and token_usd > 0:
                     chain_total += token_usd
 
-                symbol = metadata.get("symbol") or token_data.get("symbol") or "?"
-                name = metadata.get("name") or token_data.get("name") or "?"
-
                 display = f"≈ ${token_usd:,.2f}" if token_usd is not None and token_usd > 0 else "?"
+                token_link = dexscreener_link(chain, contract)
 
                 chain_lines.append(
-                    f"• {symbol} ({name}): {balance:.8f} ({display})"
+                    f"• {html_link(symbol, token_link)}: {fmt_num(balance)} ({display})"
                 )
 
             except Exception as e:
@@ -427,7 +480,7 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
         total_usd_portfolio += chain_total
 
         lines.append("")
-        lines.append(f"⛓️ {conf['name']}")
+        lines.append(f"⛓️ {esc(conf['name'])}")
         lines.append(f"Общая стоимость: ≈ ${chain_total:,.2f}")
         lines.extend(chain_lines)
 
@@ -437,7 +490,7 @@ async def show_multichain_evm_balances(update: Update, context: ContextTypes.DEF
         context.bot,
         update.effective_chat.id,
         "\n".join(lines),
-        parse_mode=None,
+        parse_mode="HTML",
     )
 
     keyboard = [
@@ -467,7 +520,7 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     lines = [
         "💰 Баланс Solana",
-        f"Адрес: `{address}`",
+        f"Адрес: {esc(address)}",
     ]
 
     total_usd = 0.0
@@ -479,20 +532,23 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if isinstance(native_balance, dict):
             lamports = int(native_balance.get("lamports") or 0)
-            sol_amount = lamports / (10 ** 9)
+            sol_amount = lamports / (10**9)
 
             if sol_amount > 0:
                 sol_price = await price_service.get_price(
                     "solana",
-                    "So11111111111111111111111111111111111111111",
+                    WSOL_MINT,
                 )
 
                 sol_usd = sol_amount * sol_price if sol_price else 0.0
                 total_usd += sol_usd
 
                 display = f"≈ ${sol_usd:,.2f}" if sol_usd > 0 else "?"
+                sol_link = dexscreener_link("solana", WSOL_MINT)
 
-                lines.append(f"• SOL: {sol_amount:.9f} ({display})")
+                lines.append(
+                    f"• {html_link('SOL', sol_link)}: {fmt_num(sol_amount)} ({display})"
+                )
 
         tokens = data.get("tokens") or data.get("balances") or []
 
@@ -512,13 +568,18 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
 
                 metadata = await metadata_service.get_solana_metadata(mint, hint=tok)
 
+                symbol = metadata.get("symbol") or tok.get("symbol") or "?"
+                name = metadata.get("name") or tok.get("name") or "?"
+
                 spam = await spam_filter.is_spam(
                     network="solana",
                     token_address=mint,
-                    symbol=metadata.get("symbol") or "?",
+                    symbol=symbol,
+                    name=name,
                     decimals=decimals,
                     raw_balance=raw,
                     is_native=False,
+                    strict=False,
                 )
 
                 if spam.get("is_spam"):
@@ -536,10 +597,11 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
                 else:
                     display = "?"
 
-                symbol = metadata.get("symbol") or tok.get("symbol") or "?"
-                name = metadata.get("name") or tok.get("name") or "?"
+                token_link = dexscreener_link("solana", mint)
 
-                lines.append(f"• {symbol} ({name}): {balance:.8f} ({display})")
+                lines.append(
+                    f"• {html_link(symbol, token_link)}: {fmt_num(balance)} ({display})"
+                )
 
             except Exception as e:
                 logger.debug("Solana token balance error: %s", e)
@@ -559,7 +621,7 @@ async def show_solana_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.bot,
         update.effective_chat.id,
         "\n".join(lines),
-        parse_mode=None,
+        parse_mode="HTML",
     )
 
     keyboard = [
@@ -698,25 +760,27 @@ async def run_evm_history(query, context, chain: str):
 
         for item in found:
             token = item["token"]
+            amount = float(item.get("amount") or 0)
+            price = item.get("price_usd")
+            usd_val = amount * price if price else 0.0
 
             grouped.setdefault(
                 token,
                 {
                     "symbol": item.get("symbol") or "?",
-                    "name": item.get("name") or "?",
                     "buyers": set(),
-                    "txs": [],
                     "amounts": [],
-                    "price_usd": item.get("price_usd"),
+                    "usd_sum": 0.0,
+                    "price_usd": price,
                 },
             )
 
             grouped[token]["buyers"].add(item.get("buyer"))
-            grouped[token]["txs"].append(item.get("tx"))
-            grouped[token]["amounts"].append(item.get("amount"))
+            grouped[token]["amounts"].append(amount)
+            grouped[token]["usd_sum"] += usd_val
 
         lines = [
-            f"✅ История покупок {conf['name']}",
+            f"✅ История покупок {esc(conf['name'])}",
             f"Найдено токенов: {len(grouped)}",
             f"Глубина: {max_depth}",
             f"Период: {lookback_days} дней",
@@ -724,25 +788,20 @@ async def run_evm_history(query, context, chain: str):
         ]
 
         for token, data in grouped.items():
-            buyers = ", ".join(list(data["buyers"])[:5])
-            tx = data["txs"][-1]
+            symbol = data["symbol"]
+            link = dexscreener_link(chain, token)
             amount = data["amounts"][-1]
-            price = data["price_usd"]
+            usd_sum = data["usd_sum"]
 
-            price_text = f" ≈ ${price:,.6f}" if price else ""
+            price_text = f" ≈ ${usd_sum:,.6f}" if usd_sum > 0 else ""
 
-            lines.append(f"• {data['symbol']} ({data['name']})")
-            lines.append(f"  Token: `{token}`")
-            lines.append(f"  Покупатель: `{buyers}`")
-            lines.append(f"  Кол-во: {amount}{price_text}")
-            lines.append(f"  Tx: `{tx}`")
-            lines.append("")
+            lines.append(f"• {html_link(symbol, link)}: {fmt_num(amount)}{price_text}")
 
         await send_long_message(
             context.bot,
             query.message.chat_id,
             "\n".join(lines),
-            parse_mode=None,
+            parse_mode="HTML",
         )
 
     except Exception as e:
@@ -811,22 +870,24 @@ async def run_solana_history(query, context):
 
         for item in found:
             token = item["token"]
+            amount = float(item.get("amount") or 0)
+            price = item.get("price_usd")
+            usd_val = amount * price if price else 0.0
 
             grouped.setdefault(
                 token,
                 {
                     "symbol": item.get("symbol") or "?",
-                    "name": item.get("name") or "?",
                     "buyers": set(),
-                    "txs": [],
                     "amounts": [],
-                    "price_usd": item.get("price_usd"),
+                    "usd_sum": 0.0,
+                    "price_usd": price,
                 },
             )
 
             grouped[token]["buyers"].add(item.get("buyer"))
-            grouped[token]["txs"].append(item.get("tx"))
-            grouped[token]["amounts"].append(item.get("amount"))
+            grouped[token]["amounts"].append(amount)
+            grouped[token]["usd_sum"] += usd_val
 
         lines = [
             "✅ История покупок Solana",
@@ -837,25 +898,20 @@ async def run_solana_history(query, context):
         ]
 
         for token, data in grouped.items():
-            buyers = ", ".join(list(data["buyers"])[:5])
-            tx = data["txs"][-1]
+            symbol = data["symbol"]
+            link = dexscreener_link("solana", token)
             amount = data["amounts"][-1]
-            price = data["price_usd"]
+            usd_sum = data["usd_sum"]
 
-            price_text = f" ≈ ${price:,.6f}" if price else ""
+            price_text = f" ≈ ${usd_sum:,.6f}" if usd_sum > 0 else ""
 
-            lines.append(f"• {data['symbol']} ({data['name']})")
-            lines.append(f"  Mint: `{token}`")
-            lines.append(f"  Покупатель: `{buyers}`")
-            lines.append(f"  Кол-во: {amount}{price_text}")
-            lines.append(f"  Tx: `{tx}`")
-            lines.append("")
+            lines.append(f"• {html_link(symbol, link)}: {fmt_num(amount)}{price_text}")
 
         await send_long_message(
             context.bot,
             query.message.chat_id,
             "\n".join(lines),
-            parse_mode=None,
+            parse_mode="HTML",
         )
 
     except Exception as e:
