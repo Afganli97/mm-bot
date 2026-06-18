@@ -1,3 +1,4 @@
+# bot/solana_traversal.py
 """
 Solana graph traversal and buy search through Helius/public Solana RPC.
 Uses pagination, blockTime lookback, innerInstructions.
@@ -100,7 +101,12 @@ class SolanaTraversal:
 
             stop_all = False
 
-            while self.queue and self.total_addresses <= self.max_addresses and len(self.unique_tokens) < self.max_tokens and not stop_all:
+            while (
+                self.queue
+                and self.total_addresses <= self.max_addresses
+                and len(self.unique_tokens) < self.max_tokens
+                and not stop_all
+            ):
                 addr, depth = self.queue.popleft()
                 logger.debug("Process Solana address %s depth=%s", addr, depth)
 
@@ -171,6 +177,7 @@ class SolanaTraversal:
                 await asyncio.sleep(0.05)
 
             update_request_status(self.request_id, "done", finished=True)
+
             logger.info(
                 "Solana traversal done. Addresses=%s txs=%s tokens=%s",
                 self.total_addresses,
@@ -182,8 +189,10 @@ class SolanaTraversal:
 
         except Exception as e:
             logger.exception("Critical Solana traversal error")
+
             if self.request_id:
                 update_request_status(self.request_id, "error", str(e), finished=True)
+
             raise
 
     async def _process_transaction(self, addr: str, depth: int, sig: str, tx_data: Dict):
@@ -222,9 +231,11 @@ class SolanaTraversal:
                 network="solana",
                 token_address=mint,
                 symbol=metadata.get("symbol", "?"),
+                name=metadata.get("name", "?"),
                 decimals=decimals,
                 raw_balance=raw_amount,
                 is_native=False,
+                strict=True,
             )
 
             if spam.get("is_spam"):
@@ -303,7 +314,10 @@ class SolanaTraversal:
                 self.queue.append((to_addr, depth + 1))
                 self.total_addresses += 1
                 branch_added += 1
-                update_task_progress(self.request_id, processed_addresses=self.total_addresses)
+                update_task_progress(
+                    self.request_id,
+                    processed_addresses=self.total_addresses,
+                )
 
     @staticmethod
     def _token_balance_map(items: List[Dict], owner: str) -> Dict[str, Dict]:
@@ -318,6 +332,7 @@ class SolanaTraversal:
                 continue
 
             ui_amount = item.get("uiTokenAmount", {}).get("uiAmount")
+
             if ui_amount is None:
                 amount_raw = int(item.get("uiTokenAmount", {}).get("amount") or 0)
                 decimals = int(item.get("uiTokenAmount", {}).get("decimals") or 0)
