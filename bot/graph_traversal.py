@@ -1,3 +1,4 @@
+# bot/graph_traversal.py
 """
 EVM graph traversal and buy search.
 """
@@ -104,13 +105,21 @@ class GraphTraversal:
             self.total_addresses = 1
             update_task_progress(self.request_id, processed_addresses=self.total_addresses)
 
-            while queue and self.total_addresses <= self.max_addresses and len(self.unique_token_addresses) < self.max_tokens:
+            while (
+                queue
+                and self.total_addresses <= self.max_addresses
+                and len(self.unique_token_addresses) < self.max_tokens
+            ):
                 addr, depth = queue.popleft()
                 logger.debug("Analyze EVM address %s depth=%s", addr, depth)
 
                 try:
                     if not get_visited_address_cache(self.network.key, addr, self.start_block):
-                        buys = await self.network.get_incoming_buys(addr, self.start_block, self.end_block)
+                        buys = await self.network.get_incoming_buys(
+                            addr,
+                            self.start_block,
+                            self.end_block,
+                        )
                         self.total_transactions += len(buys)
                         await self._process_buys(addr, buys)
                         set_visited_address_cache(self.network.key, addr, self.start_block)
@@ -215,9 +224,11 @@ class GraphTraversal:
                 network=self.network.key,
                 token_address=token,
                 symbol=metadata.get("symbol", "?"),
+                name=metadata.get("name", "?"),
                 decimals=decimals,
                 raw_balance=raw_balance,
                 is_native=False,
+                strict=True,
             )
 
             if spam.get("is_spam"):
