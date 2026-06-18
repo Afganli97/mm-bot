@@ -1,3 +1,4 @@
+# bot/api_clients.py
 """
 API clients for free services:
 Etherscan, BscScan, Ankr, Moralis, Alchemy, Helius,
@@ -6,15 +7,16 @@ DexScreener, GeckoTerminal, Jupiter, Birdeye, public RPC.
 import asyncio
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 import aiohttp
 
 from bot.config import (
-    ETHERSCAN_API_KEYS,
-    BSCSCAN_API_KEYS,
-    ANKR_API_URL,
     BIRDEYE_API_KEY,
+    BSCSCAN_API_KEYS,
+    ETHERSCAN_API_KEYS,
+    HELIUS_API_KEY,
 )
 from bot.rate_limits import RateLimitExceeded, RateLimitTracker
 
@@ -72,7 +74,12 @@ class APIKeyRotator:
                     await asyncio.sleep(delay)
 
                 if method.upper() == "GET":
-                    async with session.get(url, params=req_params, headers=req_headers, timeout=30) as resp:
+                    async with session.get(
+                        url,
+                        params=req_params,
+                        headers=req_headers,
+                        timeout=30,
+                    ) as resp:
                         if resp.status in (429, 500, 502, 503, 504):
                             await asyncio.sleep(1.5)
                             continue
@@ -81,7 +88,12 @@ class APIKeyRotator:
                         data = await resp.json()
 
                 else:
-                    async with session.post(url, json=req_json, headers=req_headers, timeout=30) as resp:
+                    async with session.post(
+                        url,
+                        json=req_json,
+                        headers=req_headers,
+                        timeout=30,
+                    ) as resp:
                         if resp.status in (429, 500, 502, 503, 504):
                             await asyncio.sleep(1.5)
                             continue
@@ -94,14 +106,19 @@ class APIKeyRotator:
                         message = str(data.get("message", "")).lower()
                         result = str(data.get("result", "")).lower()
 
-                        if message in ("no transactions found", "no records found") or "no records found" in result:
+                        if (
+                            message in ("no transactions found", "no records found")
+                            or "no records found" in result
+                        ):
                             return {"status": "1", "message": "OK", "result": []}
 
                         if "limit" in message or "limit" in result or "rate limit" in result:
                             await asyncio.sleep(1)
                             continue
 
-                        raise Exception(f"{self.service} Error: {data.get('message')} {data.get('result')}")
+                        raise Exception(
+                            f"{self.service} Error: {data.get('message')} {data.get('result')}"
+                        )
 
                 return data
 
@@ -116,6 +133,11 @@ class APIKeyRotator:
 
 
 class EVMExplorerClient:
+    """
+    Etherscan V2 API.
+    Используется для Ethereum history.
+    """
+
     BASE_URL = "https://api.etherscan.io/v2/api"
 
     def __init__(self, chain_id: int = 1, delay: float = 0.22):
@@ -260,6 +282,11 @@ class EVMExplorerClient:
 
 
 class BscScanClient:
+    """
+    BscScan Free API.
+    Используется для BSC history, native transfers, internal transfers, BEP20 transfers.
+    """
+
     BASE_URL = "https://api.bscscan.com/api"
 
     def __init__(self, delay: float = 0.22):
@@ -450,7 +477,12 @@ class MoralisClient:
         self.api_key = api_key
         self.headers = {"X-API-Key": api_key} if api_key else {}
 
-    async def get_balances(self, session: aiohttp.ClientSession, address: str, chain: str = "eth") -> List[Dict]:
+    async def get_balances(
+        self,
+        session: aiohttp.ClientSession,
+        address: str,
+        chain: str = "eth",
+    ) -> List[Dict]:
         if not self.api_key:
             return []
 
@@ -469,7 +501,12 @@ class MoralisClient:
                     "page_size": page_size,
                 }
 
-                async with session.get(url, params=params, headers=self.headers, timeout=30) as resp:
+                async with session.get(
+                    url,
+                    params=params,
+                    headers=self.headers,
+                    timeout=30,
+                ) as resp:
                     if resp.status != 200:
                         logger.debug("Moralis HTTP %s", resp.status)
                         break
@@ -497,7 +534,11 @@ class AlchemyClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
 
-    async def get_token_balances(self, session: aiohttp.ClientSession, address: str) -> List[Dict]:
+    async def get_token_balances(
+        self,
+        session: aiohttp.ClientSession,
+        address: str,
+    ) -> List[Dict]:
         if not self.api_key:
             return []
 
@@ -520,7 +561,8 @@ class AlchemyClient:
                     item
                     for item in balances
                     if item.get("tokenBalance")
-                    and item.get("tokenBalance") != "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    and item.get("tokenBalance")
+                    != "0x0000000000000000000000000000000000000000000000000000000000000000"
                 ]
         except RateLimitExceeded:
             raise
@@ -740,7 +782,50 @@ class BirdeyeTokenOverview:
             return None
 
 
+class EVMPriceCascade:
+    def __init__(self, web3_client: Optional["EVMWeb3Client"] = None):
+        self.dexscr = DexScreenerPrice()
+        self.gecko = GeckoTerminalPrice()
+        self.web3 = web3_client
+
+    async def get_price(
+        self,
+        session: aiohttp.ClientSession,
+        token_address: str,
+        network_name: str = "ethereum",
+        weth_price_usd: float = 0.0,
+    ) -> Optional[float]:
+        price_data = await self.dexscr.get_price(session, token_address)
+        if price_data and price_data.get("price_usd"):
+            return float(price_data["price_usd"])
+
+        await asyncio.sleep(0.2)
+
+        gecko_net = {"ethereum": "eth", "bsc": "bsc", "eth": "eth"}.get(network_name, "eth")
+        price_data = await self.gecko.get_price(session, token_address, gecko_net)
+        if price_data and price_data.get("price_usd"):
+            return float(price_data["price_usd"])
+
+        await asyncio.sleep(0.2)
+
+        if self.web3:
+            try:
+                return await self.web3.get_price_via_router(
+                    session,
+                    token_address,
+                    weth_price_usd,
+                )
+            except Exception:
+                pass
+
+        return None
+
+
 class EVMWeb3Client:
+    """
+    Public/free EVM RPC client.
+    """
+
     TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
     def __init__(
@@ -812,9 +897,14 @@ class EVMWeb3Client:
 
     async def get_balance(self, session: aiohttp.ClientSession, address: str) -> float:
         raw = await self.get_balance_raw(session, address)
-        return raw / 10**18
+        return raw / (10**18)
 
-    async def get_balance_at_block_raw(self, session: aiohttp.ClientSession, address: str, block_number: int) -> int:
+    async def get_balance_at_block_raw(
+        self,
+        session: aiohttp.ClientSession,
+        address: str,
+        block_number: int,
+    ) -> int:
         return int(await self._rpc_call(session, "eth_getBalance", [address, hex(block_number)]), 16)
 
     async def get_token_balance_at_block_raw(
@@ -944,7 +1034,7 @@ class EVMWeb3Client:
             weth_out = int(result[2 + amounts_offset + 64 * 2 :], 16)
 
             if weth_out > 0:
-                return (weth_out / 10**18) * weth_price_usd
+                return (weth_out / (10**18)) * weth_price_usd
 
         except Exception as e:
             logger.debug("Router price failed for %s: %s", token_address, e)
